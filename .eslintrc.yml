@@ -32,10 +32,10 @@ rules:
   arrow-parens: [2, as-needed]
   arrow-spacing: [2, {before: true, after: true}]
   block-scoped-var: [2]
-  brace-style: [2]
+  brace-style: [2, 1tbs, {allowSingleLine: true}]
   camelcase: [2, {properties: never, allow: ["^GM_\\w+"]}]
   class-methods-use-this: [2]
-  comma-dangle: [2, {arrays: always-multiline, objects: always-multiline}]
+  comma-dangle: [2, {arrays: always-multiline, objects: always-multiline, functions: ignore}]
   comma-spacing: [2, {before: false, after: true}]
   comma-style: [2, last]
   complexity: [0]
@@ -65,7 +65,7 @@ rules:
   lines-around-comment: [0]
   lines-around-directive: [0]
   max-len: [2, {
-    code: 100,
+    code: 120,
     ignoreComments: true,
     ignoreRegExpLiterals: true,
     ignoreTemplateLiterals: true,
@@ -216,7 +216,7 @@ rules:
   prefer-const: [1, {destructuring: all, ignoreReadBeforeAssign: true}]
   prefer-numeric-literals: [2]
   prefer-rest-params: [0]
-  quote-props: [2, consistent]
+  quote-props: [2, as-needed, {unnecessary: false}]
   quotes: [1, single, avoid-escape]
   radix: [2, as-needed]
   require-jsdoc: [0]

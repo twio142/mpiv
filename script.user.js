@@ -4,10 +4,12 @@
 // @description Shows images and videos behind links and thumbnails.
 //
 // @include     *
+// @run-at      document-start
 //
 // @grant       GM_addElement
 // @grant       GM_download
 // @grant       GM_getValue
+// @grant       GM_getValues
 // @grant       GM_openInTab
 // @grant       GM_registerMenuCommand
 // @grant       GM_unregisterMenuCommand
@@ -23,7 +25,7 @@
 // @grant       GM.setValue
 // @grant       GM.xmlHttpRequest
 //
-// @version     1.2.21
+// @version     1.4.1
 // @author      tophf
 //
 // @original-version 2017.9.29
@@ -62,18 +64,18 @@ let cfg;
 /** @type mpiv.AppInfo */
 let ai = {rule: {}};
 /** @type Element */
-let elConfig;
+let elSetup;
 let nonce;
 
 const doc = document;
 const hostname = location.hostname;
 const dotDomain = '.' + hostname;
-const isGoogleDomain = /(^|\.)google(\.com?)?(\.\w+)?$/.test(hostname);
-const isGoogleImages = isGoogleDomain && /[&?]tbm=isch(&|$)/.test(location.search);
 const isFF = CSS.supports('-moz-appearance', 'none');
 const AudioContext = window.AudioContext || function () {};
+const {from: arrayFrom, isArray} = Array;
 
 const PREFIX = 'mpiv-';
+const NOAA_ATTR = 'data-no-aa';
 const STATUS_ATTR = `${PREFIX}status`;
 const MSG = Object.assign({}, ...[
   'getViewSize',
@@ -87,25 +89,21 @@ const SETTLE_TIME = 50;
 const RX_HAS_CODE = /(^|[^-\w])return[\W\s]/;
 const RX_EVAL_BLOCKED = /'Trusted(Script| Type)'|unsafe-eval/;
 const RX_MEDIA_URL = /^(?!data:)[^?#]+?\.(avif|bmp|jpe?g?|gif|mp4|png|svgz?|web[mp])($|[?#])/i;
+const BLANK_PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 const ZOOM_MAX = 16;
 const SYM_U = Symbol('u');
-const TRUSTED = (({trustedTypes}, policy) =>
-  trustedTypes ? trustedTypes.createPolicy('mpiv', policy) : policy
-)(window, {
-  createHTML: str => str,
-  createScript: str => str,
-});
 const FN_ARGS = {
   s: ['m', 'node', 'rule'],
   c: ['text', 'doc', 'node', 'rule'],
   q: ['text', 'doc', 'node', 'rule'],
   g: ['text', 'doc', 'url', 'm', 'rule', 'node', 'cb'],
 };
+let trustedHTML, trustedScript;
 //#endregion
 //#region GM4 polyfill
 
 if (typeof GM === 'undefined' || !GM.xmlHttpRequest)
-  this.GM = {info: GM_info};
+  this.GM = {__proto__: null, info: GM_info};
 if (!GM.getValue)
   GM.getValue = GM_getValue; // we use it only with `await` so no need to return a Promise
 if (!GM.setValue)
@@ -129,43 +127,44 @@ const App = {
   isImageTab: false,
   globalStyle: '',
   popupStyleBase: '',
+  tabfix: /\.(dumpoir|greatfon|picuki)\.com$/.test(dotDomain),
+  NOP: /\.(facebook|instagram|chrome|google)\.com$/.test(dotDomain) &&
+    (() => {}),
 
   activate(info, event) {
     const {match, node, rule, url} = info;
-    if (elConfig) console.info({node, rule, url, match});
+    const auto = cfg.start === 'auto';
+    const vidCtrl = cfg.videoCtrl && isVideo(node);
+    if (elSetup) console.info({node, rule, url, match});
+    if (auto && vidCtrl && !Events.ctrl)
+      return;
     if (ai.node) App.deactivate();
     ai = info;
-    ai.force = event.altKey;
+    ai.force = Events.ctrl;
     ai.gNum = 0;
     ai.zooming = cfg.css.includes(`${PREFIX}zooming`);
     Util.suppressTooltip();
     Calc.updateViewSize();
+    Events.ctrl = false;
     Events.toggle(true);
     Events.trackMouse(event);
-    if (ai.force) {
+    if (ai.force && (auto || cfg.start === 'ctrl' || cfg.start === 'context')) {
       App.start();
-    } else if (cfg.start === 'auto' && !rule.manual) {
-      App.belate();
+    } else if ((auto || cfg.preload) && !vidCtrl && !rule.manual) {
+      App.belate(auto);
     } else {
       Status.set('ready');
     }
   },
 
-  belate() {
+  belate(auto) {
     if (cfg.preload) {
-      ai.preloadStart = now();
+      ai.preloadStart = auto ? now() : -1;
       App.start();
       Status.set('+preloading');
-      setTimeout(Status.set, cfg.delay, '-preloading');
     } else {
       ai.timer = setTimeout(App.start, cfg.delay);
     }
-  },
-
-  checkImageTab() {
-    const el = doc.body.firstElementChild;
-    App.isImageTab = el && el === doc.body.lastElementChild && el.matches('img, video');
-    App.isEnabled = cfg.imgtab || !App.isImageTab;
   },
 
   checkProgress({start} = {}) {
@@ -182,6 +181,12 @@ const App = {
     }
   },
 
+  canClose: (p = ai.popup) => !p || (
+    isVideo(p)
+      ? !cfg.keepVids
+      : document.fullscreenElement !== p
+  ),
+
   canCommit(w, h) {
     if (!ai.force && ai.rect && !ai.gItems &&
         Math.max(w / (ai.rect.width || 1), h / (ai.rect.height || 1)) < cfg.scale) {
@@ -189,10 +194,12 @@ const App = {
       return false;
     }
     App.stopTimers();
-    const wait = ai.preloadStart && (ai.preloadStart + cfg.delay - now());
-    if (wait > 0) {
+    let wait = ai.preloadStart;
+    if (wait < 0 && !ai.force || !ai.popup)
+      return;
+    if (wait > 0 && (wait += cfg.delay - now()) > 0) {
       ai.timer = setTimeout(App.checkProgress, wait);
-    } else if ((ai.urls || 0).length && Math.max(w, h) < 130) {
+    } else if ((!w || !h) && (ai.urls || []).length) {
       App.handleError({type: 'error'});
     } else {
       App.commit();
@@ -201,13 +208,14 @@ const App = {
   },
 
   async commit() {
-    const p = ai.popup;
+    const p = ai.popupShown = ai.popup;
     const isDecoded = cfg.waitLoad && isFunction(p.decode);
     if (isDecoded) {
       await p.decode();
       if (p !== ai.popup)
         return;
     }
+    Status.set('-preloading');
     App.updateStyles();
     Calc.measurePopup();
     const willZoom = cfg.zoom === 'auto' || App.isImageTab && cfg.imgtab;
@@ -225,12 +233,14 @@ const App = {
       if (isFF && p.complete && !isDecoded)
         p.style.backgroundImage = `url('${p.src}')`;
     }
+    if (ai.preloadStart < 0 && isFunction(p.play))
+      p.play().catch(now);
   },
 
   deactivate({wait} = {}) {
-    App.stopTimers();
+    App.stopTimers(true);
     if (ai.req)
-      tryCatch.call(ai.req, ai.req.abort);
+      tryCatch(ai.req.abort);
     if (ai.tooltip)
       ai.tooltip.node.title = ai.tooltip.text;
     Status.set(false);
@@ -261,7 +271,7 @@ const App = {
     }
     const fe = Util.formatError(e, rule);
     if (!rule || !ai.urls || !ai.urls.length)
-      console.warn(fe.consoleFormat, ...fe.consoleArgs);
+      console.warn(...fe);
     if (ai.urls && ai.urls.length) {
       ai.url = ai.urls.shift();
       if (ai.url) {
@@ -301,11 +311,6 @@ const App = {
   },
 
   start() {
-    // check explicitly as the cursor may have moved into an iframe so mouseout wasn't reported
-    if (!Util.isHovered(ai.node)) {
-      App.deactivate();
-      return;
-    }
     App.updateStyles();
     if (ai.gallery)
       App.startGallery();
@@ -315,10 +320,14 @@ const App = {
 
   startSingle() {
     Status.loading();
+    if (ai.force && ai.preloadStart < 0) {
+      App.commit();
+      return;
+    }
     ai.imageUrl = null;
     if (ai.rule.follow && !ai.rule.q && !ai.rule.s) {
       Req.findRedirect();
-    } else if (ai.rule.q && !Array.isArray(ai.urls)) {
+    } else if (ai.rule.q && !isArray(ai.urls)) {
       App.startFromQ();
     } else {
       Popup.create(ai.url);
@@ -352,11 +361,9 @@ const App = {
     try {
       const startUrl = ai.url;
       const p = await Req.getDoc(ai.rule.s !== 'gallery' && startUrl);
-      const items = await new Promise(resolve => {
-        const it = ai.gallery(p.responseText, p.doc, p.finalUrl, ai.match, ai.rule, ai.node,
-          resolve);
-        if (Array.isArray(it))
-          resolve(it);
+      const items = await new Promise(cb => {
+        const res = ai.gallery(p.responseText, p.doc, p.finalUrl, ai.match, ai.rule, ai.node, cb);
+        if (res !== undefined) cb(res);
       });
       // bail out if the gallery's async callback took too long
       if (ai.url !== startUrl) return;
@@ -364,9 +371,8 @@ const App = {
       ai.gItems = items.length && items;
       if (ai.gItems) {
         const i = items.index;
-        ai.gIndex = i === (i | 0) && items[i] ? i | 0 :
-          typeof i === 'string' ? clamp(items.findIndex(x => x.url === i), 0) :
-            Gallery.findIndex(ai.url);
+        ai.gIndex = i >= 0 && items[i] ? +i :
+          Gallery.findIndex(typeof i === 'string' ? i : ai.url);
         setTimeout(Gallery.next);
       } else {
         throw 'Empty gallery';
@@ -376,8 +382,8 @@ const App = {
     }
   },
 
-  stopTimers() {
-    for (const timer of ['timer', 'timerBar', 'timerStatus'])
+  stopTimers(bar) {
+    for (const timer of ['timer', 'timerStatus', bar && 'timerBar'])
       clearTimeout(ai[timer]);
     clearInterval(ai.timerProgress);
   },
@@ -404,40 +410,53 @@ const App = {
 
 const Bar = {
 
-  set(label, className) {
+  set(label, cls, prefix) {
     let b = ai.bar;
     if (typeof label !== 'string') {
       $remove(b);
       ai.bar = null;
       return;
     }
-    if (!b) b = ai.bar = $create('div', {id: `${PREFIX}bar`});
+    const force = !b && 0;
+    if (!b) b = ai.bar = $new('div', {id: `${PREFIX}bar`, className: `${PREFIX}${cls}`});
+    ai.barText = label;
     App.updateStyles();
     Bar.updateDetails();
-    Bar.show();
-    b.textContent = '';
-    b.innerHTML = TRUSTED.createHTML(label);
+    Bar.setText(cfg.uiInfoCaption || cls === 'error' || cls === 'xhr' ? label : '');
+    $dataset(b, 'prefix', prefix);
+    setTimeout(Bar.show, 0, force);
     if (!b.parentNode) {
       doc.body.appendChild(b);
       Util.forceLayout(b);
     }
-    b.className = `${PREFIX}show ${PREFIX}${className}`;
   },
 
-  show(isForced) {
-    clearTimeout(ai.timerBar);
-    ai.bar.style.removeProperty('opacity');
-    if (isForced)
-      ai.bar.dataset.force = '';
-    else
-      ai.timerBar = setTimeout(Bar.hide, 3000);
-  },
-
-  hide(isForced) {
-    if (ai.bar && (isForced || !ai.bar.dataset.force)) {
-      $css(ai.bar, {opacity: 0});
-      delete ai.bar.dataset.force;
+  setText(text) {
+    if (/<([a-z][-a-z]*)[^<>]*>[^<>]*<\/\1\s*>/i.test(text)) { // checking for <tag...>...</tag>
+      ai.bar.innerHTML = trustedHTML ? trustedHTML(text) : text;
+    } else {
+      ai.bar.textContent = text;
     }
+  },
+
+  show(force) {
+    const b = ai.bar;
+    if (!force && (!cfg.uiInfo || force !== 0 && cfg.uiInfoOnce) || ai.barShown)
+      return;
+    clearTimeout(ai.timerBar);
+    b.classList.add(PREFIX + 'show');
+    $dataset(b, 'force', force === 2 ? '' : null);
+    ai.timerBar = !force && setTimeout(Bar.hide, cfg.uiInfoHide * 1000);
+    ai.barShown = true;
+  },
+
+  hide(force) {
+    const b = ai.bar;
+    if (!b || !force && (!cfg.uiInfo || b.dataset.force) || !ai.barShown)
+      return;
+    $dataset(b, 'force', force === 2 ? '' : null);
+    b.classList.remove(PREFIX + 'show');
+    ai.barShown = false;
   },
 
   updateName() {
@@ -445,11 +464,11 @@ const Bar = {
     if (gi) {
       const item = gi[i];
       const noDesc = !gi.some(_ => _.desc);
-      const c = `${n > 1 ? `[${i + 1}/${n}] ` : ''}${[
+      const c = [
         gi.title && (!i || noDesc) && !`${item.desc || ''}`.includes(gi.title) && gi.title || '',
         item.desc,
-      ].filter(Boolean).join(' - ')}`;
-      Bar.set(c.trim() || ' ', 'gallery', true);
+      ].filter(Boolean).join(' - ');
+      Bar.set(c.trim() || ' ', 'gallery', n > 1 ? `${i + 1}/${n}` : null);
     } else if ('caption' in ai) {
       Bar.set(ai.caption, 'caption');
     } else if (ai.tooltip) {
@@ -478,8 +497,7 @@ const Bar = {
       Calc.aspectRatio(ai.nwidth, ai.nheight)
     }`.replace(/\x20/g, '\xA0');
     if (ai.bar.dataset.zoom !== zoom || !ai.nwidth) {
-      if (zoom) ai.bar.dataset.zoom = zoom;
-      else delete ai.bar.dataset.zoom;
+      $dataset(ai.bar, 'zoom', zoom || null);
       Bar.show();
     }
   },
@@ -535,7 +553,7 @@ const Calc = {
       nw = ai.nwidth = w;
       p.style.cssText = `width: ${nw}px !important; height: ${nh}px !important;`;
     }
-    p.className = `${PREFIX}show`;
+    p.classList.add(`${PREFIX}show`);
     p.removeAttribute('style');
     const s = getComputedStyle(p);
     const o2 = sumProps(s.outlineOffset, s.outlineWidth) * 2;
@@ -576,22 +594,21 @@ const Calc = {
   },
 
   rect() {
-    let {node, rule} = ai;
+    const {node, rule} = ai;
     let n = rule.rect && node.closest(rule.rect);
     if (n) return n.getBoundingClientRect();
-    const nested = node.getElementsByTagName('*');
+    const nested = (n = node).firstElementChild ? document.elementsFromPoint(ai.cx, ai.cy) : [];
     let maxArea = 0;
     let maxBounds;
-    n = node;
-    for (let i = 0; n; n = nested[i++]) {
+    let i = 0;
+    do {
       const bounds = n.getBoundingClientRect();
       const area = bounds.width * bounds.height;
       if (area > maxArea) {
         maxArea = area;
         maxBounds = bounds;
-        node = n;
       }
-    }
+    } while ((n = nested[i++]) && node.contains(n));
     return maxBounds;
   },
 
@@ -665,7 +682,7 @@ class Config {
     }
     if (Object.keys(cfg || {}).some(k => /^ui|^(css|globalStatus)$/.test(k) && cfg[k] !== c[k]))
       App.globalStyle = '';
-    if (!Array.isArray(c.scales))
+    if (!isArray(c.scales))
       c.scales = [];
     c.scales = [...new Set(c.scales)].sort((a, b) => parseFloat(a) - parseFloat(b));
     Object.assign(this, DEFAULTS, c);
@@ -682,7 +699,8 @@ class Config {
   }
 }
 
-Config.DEFAULTS = /** @type mpiv.Config */ Object.assign(Object.create(null), {
+Config.DEFAULTS = /** @type mpiv.Config */ {
+  __proto__: null,
   center: false,
   css: '',
   delay: 500,
@@ -703,9 +721,12 @@ Config.DEFAULTS = /** @type mpiv.Config */ Object.assign(Object.create(null), {
     s: '',
   }],
   imgtab: false,
+  keepOnBlur: false,
+  keepVids: false,
   mute: false,
+  night: false,
   preload: false,
-  scale: 1.25,
+  scale: 1.05,
   scales: ['0!', 0.125, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 8, 16],
   start: 'auto',
   startAlt: 'context',
@@ -717,18 +738,23 @@ Config.DEFAULTS = /** @type mpiv.Config */ Object.assign(Object.create(null), {
   uiBorder: 0,
   uiFadein: true,
   uiFadeinGallery: true, // some computers show white background while loading so fading hides it
+  uiInfo: true,
+  uiInfoCaption: true,
+  uiInfoHide: 3,
+  uiInfoOnce: true,
   uiShadowColor: '#000000',
   uiShadowOpacity: 80,
   uiShadow: 20,
   uiPadding: 0,
   uiMargin: 0,
   version: 6,
+  videoCtrl: true,
   waitLoad: false,
   xhr: true,
   zoom: 'context',
   zoomOut: 'auto',
   zoomStep: 133,
-});
+};
 
 const CspSniffer = {
 
@@ -744,7 +770,10 @@ const CspSniffer = {
       xhr.timeout = Math.max(2000, (performance.timing.responseEnd - performance.timeOrigin) * 2);
       xhr.onreadystatechange = () => {
         if (xhr.readyState >= xhr.HEADERS_RECEIVED) {
-          this.csp = this._parse(xhr.getResponseHeader('content-security-policy'));
+          this.csp = this._parse([
+            xhr.getResponseHeader('content-security-policy'),
+            $prop('meta[http-equiv="Content-Security-Policy"]', 'content'),
+          ].filter(Boolean).join(','));
           this.init = this.busy = xhr.onreadystatechange = null;
           xhr.abort();
           resolve();
@@ -806,6 +835,7 @@ const CspSniffer = {
 
 const Events = {
 
+  ctrl: false,
   hoverData: null,
   hoverTimer: 0,
   ignoreKeyHeld: false,
@@ -819,24 +849,26 @@ const Events = {
         node === ai.popup ||
         node === doc.body ||
         node === doc.documentElement ||
-        node === elConfig ||
-        ai.gallery && ai.rectHovered)
+        node === elSetup ||
+        ai.gallery && ai.rectHovered ||
+        !App.canClose())
       return;
     if (node.shadowRoot)
       node = Events.pierceShadow(node, e.clientX, e.clientY);
     // we don't want to process everything in the path of a quickly moving mouse cursor
     Events.hoverData = {e, node, start: now()};
     Events.hoverTimer = Events.hoverTimer || setTimeout(Events.onMouseOverThrottled, SETTLE_TIME);
+    node.addEventListener('mouseout', Events.onMouseOutThrottled);
   },
 
   onMouseOverThrottled(force) {
-    if (!Events.hoverData)
+    const {start, e, node, nodeOut} = Events.hoverData || {};
+    if (!node || node === nodeOut && (Events.hoverData = null, 1))
       return;
-    const {start, e, node} = Events.hoverData;
     // clearTimeout + setTimeout is expensive so we'll use the cheaper perf.now() for rescheduling
     const wait = force ? 0 : start + SETTLE_TIME - now();
-    Events.hoverTimer = wait > 10 && setTimeout(Events.onMouseOverThrottled, wait);
-    if (Events.hoverTimer || !Util.isHovered(node))
+    const t = Events.hoverTimer = wait > 10 && setTimeout(Events.onMouseOverThrottled, wait);
+    if (t)
       return;
     Events.hoverData = null;
     if (!Ruler.rules)
@@ -847,8 +879,15 @@ const Events = {
   },
 
   onMouseOut(e) {
-    if (!e.relatedTarget && !e.shiftKey)
+    if (!e.relatedTarget && !cfg.keepOnBlur && !e.shiftKey && App.canClose())
       App.deactivate();
+  },
+
+  onMouseOutThrottled(e) {
+    const d = Events.hoverData;
+    if (d) d.nodeOut = this;
+    this.removeEventListener('mouseout', Events.onMouseOutThrottled);
+    Events.hoverTimer = 0;
   },
 
   onMouseOutShadow(e) {
@@ -863,7 +902,7 @@ const Events = {
     Events.trackMouse(e);
     if (e.shiftKey)
       return;
-    if (!ai.zoomed && !ai.rectHovered) {
+    if (!ai.zoomed && !ai.rectHovered && App.canClose()) {
       App.deactivate();
     } else if (ai.zoomed) {
       Popup.move();
@@ -875,8 +914,8 @@ const Events = {
     }
   },
 
-  onMouseDown({shiftKey, button}) {
-    if (button === 0 && shiftKey && ai.popup && ai.popup.controls) {
+  onMouseDown({shiftKey, button, target}) {
+    if (!button && target === ai.popup && ai.popup.controls && (shiftKey || !App.canClose())) {
       ai.controlled = ai.zoomed = true;
     } else if (button === 2 || shiftKey) {
       // Shift = ignore; RMB will be processed in onContext
@@ -894,7 +933,7 @@ const Events = {
       Gallery.next(-dir);
     } else if (cfg.zoom === 'wheel' && dir > 0 && ai.popup) {
       App.toggleZoom();
-    } else {
+    } else if (App.canClose()) {
       App.deactivate();
       return;
     }
@@ -903,22 +942,14 @@ const Events = {
 
   onKeyDown(e) {
     // Synthesized events may be of the wrong type and not have a `key`
-    const key = eventModifiers(e) + (e.key && e.key.length > 1 ? e.key : e.code);
-    const p = ai.popup || false; // simple polyfill for `p?.foo`
-    if (!p &&
-        !Events.ignoreKeyHeld &&
-        key === '!Alt' &&
-        (cfg.start === 'alt' || cfg.start === 'context' || ai.rule.manual)) {
-      dropEvent(e);
-      if (Events.hoverData) {
-        Events.hoverData.e = e;
-        Events.onMouseOverThrottled(true);
-      }
-      if (ai.node) {
-        ai.force = true;
-        App.start();
-      }
+    const key = describeKey(e);
+    const p = ai.popupShown;
+    if (!p && key === '^Control') {
+      addEventListener('keyup', Events.onKeyUp, true);
+      Events.ctrl = true;
     }
+    if (!p && key === '^ContextMenu')
+      return Events.onContext.call(this, e);
     if (!p || e.repeat)
       return;
     switch (key) {
@@ -927,15 +958,13 @@ const Events = {
           return;
         ai.shiftKeyTime = now();
         Status.set('+shift');
-        Bar.show(true);
-        if (p.tagName === 'VIDEO')
+        if (cfg.uiInfo)
+          Bar.show(1);
+        if (isVideo(p))
           p.controls = true;
         return;
       case 'KeyA':
-        if (!p.hasAttribute('data-no-aa'))
-          p.setAttribute('data-no-aa', '');
-        else
-          p.removeAttribute('data-no-aa');
+        p.toggleAttribute(NOAA_ATTR);
         break;
       case 'ArrowRight':
       case 'KeyJ':
@@ -952,10 +981,22 @@ const Events = {
       case 'KeyY':
         Req.copyImage();
         App.deactivate();
+      case 'KeyC':
+        if (ai.bar.firstChild) {
+          Bar.setText('');
+          Bar.hide(0);
+        } else {
+          Bar.setText(ai.barText);
+          Bar.show(2);
+        }
         break;
       case 'KeyD':
         Req.saveFile();
         App.deactivate();
+        break;
+      case 'KeyF':
+        if (p !== document.fullscreenElement) p.requestFullscreen();
+        else document.exitFullscreen();
         break;
       case 'KeyH': // flip horizontally
       case 'KeyV': // flip vertically
@@ -972,9 +1013,15 @@ const Events = {
         Bar.updateDetails();
         Popup.move();
         break;
+      case 'KeyI':
+        (ai.barShown ? Bar.hide : Bar.show)(2);
+        break;
       case 'KeyM':
-        if (p.tagName === 'VIDEO')
+        if (isVideo(p))
           p.muted = !p.muted;
+        break;
+      case 'KeyN':
+        ai.night = p.classList.toggle(`${PREFIX}night`);
         break;
       case 'KeyT':
         GM.openInTab(Util.tabFixUrl() || p.src);
@@ -1000,8 +1047,8 @@ const Events = {
         App.deactivate({wait: true});
         break;
       case '!Alt':
-        // return;
-      // default:
+        return;
+      default:
         App.deactivate({wait: true});
         return;
     }
@@ -1009,29 +1056,48 @@ const Events = {
   },
 
   onKeyUp(e) {
-    if (e.key === 'Shift' && ai.shiftKeyTime) {
+    const p = ai.popupShown || false;
+    if (e.key === 'Control') {
+      if (!p) removeEventListener('keyup', Events.onKeyUp, true);
+      setTimeout(() => (Events.ctrl = false));
+    }
+    if (p && e.key === 'Shift' && ai.shiftKeyTime) {
       Status.set('-shift');
-      Bar.hide(true);
-      if ((ai.popup || {}).controls)
-        ai.popup.controls = false;
+      if (cfg.uiInfo)
+        Bar.hide(1);
+      if (p.controls)
+        p.controls = false;
       // Chrome doesn't expose events for clicks on video controls so we'll guess
       if (ai.controlled || !isFF && now() - ai.shiftKeyTime > 500)
         ai.controlled = false;
-      else if (ai.popup && (ai.zoomed || ai.rectHovered !== false))
+      else if (p && (ai.zoomed || ai.rectHovered !== false))
         App.toggleZoom();
       else
         App.deactivate({wait: true});
       ai.shiftKeyTime = 0;
+    } else if (
+      describeKey(e) === 'Control' && !p && !Events.ignoreKeyHeld &&
+      (cfg.start === 'ctrl' || cfg.start === 'context' || ai.rule.manual)
+    ) {
+      dropEvent(e);
+      if (Events.hoverData) {
+        Events.hoverData.e = e;
+        Events.onMouseOverThrottled(true);
+      }
+      if (ai.node) {
+        ai.force = true;
+        App.start();
+      }
     }
   },
 
   onContext(e) {
     if (Events.ignoreKeyHeld)
       return;
-    const p = ai.popup;
+    const p = ai.popupShown;
     if (cfg.zoom === 'context' && p && App.toggleZoom()) {
       dropEvent(e);
-    } else if (!p && (
+    } else if (!p && (!cfg.videoCtrl || !isVideo(ai.node) || Events.ctrl) && (
       cfg.start === 'context' ||
       cfg.start === 'contextMK' ||
       cfg.start === 'contextM' && (e.button === 2) ||
@@ -1052,6 +1118,10 @@ const Events = {
     }
   },
 
+  onVisibility(e) {
+    Events.ctrl = false;
+  },
+
   pierceShadow(node, x, y) {
     for (let root; (root = node.shadowRoot);) {
       root.addEventListener('mouseover', Events.onMouseOver, {passive: true});
@@ -1070,9 +1140,9 @@ const Events = {
     window[onOff]('mousemove', Events.onMouseMove, passive);
     window[onOff]('mouseout', Events.onMouseOut, passive);
     window[onOff]('mousedown', Events.onMouseDown, passive);
-    window[onOff]('keydown', Events.onKeyDown, true); // override normal page listeners
     window[onOff]('keyup', Events.onKeyUp, true);
-    window[onOff](WHEEL_EVENT, Events.onMouseScroll, {passive: false});
+    window[onOff](WHEEL_EVENT, Events.onMouseScroll, {passive: false, capture: true});
+    ai.node.removeEventListener('mouseout', Events.onMouseOutThrottled);
   },
 
   trackMouse(e) {
@@ -1118,31 +1188,33 @@ const Gallery = {
     const sel = gUrl.split('#')[1];
     if (!sel)
       return 0;
-    if (/^\d+$/.test(sel))
-      return parseInt(sel);
-    for (let i = ai.gNum; i--;) {
-      let {url} = ai.gItems[i];
-      if (Array.isArray(url))
-        url = url[0];
-      if (url.indexOf(sel, url.lastIndexOf('/')) > 0)
-        return i;
+    let i = +sel;
+    if (i >= 0 && i === (i | 0))
+      return i;
+    for (i = 0; i < ai.gNum; i++) {
+      const {url} = ai.gItems[i];
+      if (isArray(url)
+        ? url.indexOf(sel) || url.some(u => u.indexOf(sel, u.lastIndexOf('/')) > 0)
+        : url === sel || url.indexOf(sel, url.lastIndexOf('/')) > 0
+      ) return i;
     }
     return 0;
   },
 
   next(dir) {
     if (dir) ai.gIndex = Gallery.nextIndex(dir);
-    const item = ai.gItems[ai.gIndex];
-    if (Array.isArray(item.url)) {
+    const item = ai.gItem = ai.gItems[ai.gIndex];
+    if (isArray(item.url)) {
       ai.urls = item.url.slice(1);
       ai.url = item.url[0];
     } else {
       ai.urls = null;
       ai.url = item.url;
     }
-    ai.preloadUrl = ensureArray(ai.gItems[Gallery.nextIndex(dir || 1)].url)[0];
+    ai.gItemNext = ai.gItems[Gallery.nextIndex(dir || 1)];
     App.startSingle();
     Bar.updateName();
+    if (dir) Bar.show(0);
   },
 
   nextIndex(dir) {
@@ -1151,6 +1223,7 @@ const Gallery = {
 
   defaultParser(text, doc, docUrl, m, rule) {
     const {g} = rule;
+    const gi = g.index;
     const qEntry = g.entry;
     const qCaption = ensureArray(g.caption);
     const qImage = g.image || 'img';
@@ -1158,16 +1231,14 @@ const Gallery = {
     const fix =
       (typeof g.fix === 'string' ? Util.newFunction('s', 'isURL', g.fix) : g.fix) ||
       (s => s.trim());
-    const items = [...$$(qEntry || qImage, doc)]
-      .map(processEntry)
-      .filter(Boolean);
+    const elems = [...$$(qEntry || qImage, doc)];
+    const items = elems.map(processEntry).filter(Boolean);
     items.title = processTitle();
     items.index =
-      typeof g.index === 'string' &&
-        Req.findImageUrl(tryCatch($, g.index, doc), docUrl) ||
-      RX_HAS_CODE.test(g.index) &&
-        Util.newFunction('items', 'node', g.index)(items, ai.node) ||
-      g.index;
+      RX_HAS_CODE.test(gi) ? Util.newFunction('items', 'node', gi)(items, ai.node) :
+        typeof gi === 'string' ? Req.findImageUrl(tryCatch($, gi, doc), docUrl) :
+          gi == null ? Math.max(0, elems.indexOf(ai.node)) :
+            gi;
     return items;
 
     function processEntry(entry) {
@@ -1179,19 +1250,17 @@ const Gallery = {
       } catch (e) {}
       return item.url && item;
     }
-
-    function processCaption(selector) {
-      const el = $(selector, this) ||
-                 $orSelf(selector, this.previousElementSibling) ||
-                 $orSelf(selector, this.nextElementSibling);
-      return el && fix(el.textContent);
+    function processCaption(sel) {
+      const el = !sel ? this
+        : $(sel, this) ||
+          $orSelf(sel, this.previousElementSibling) ||
+          $orSelf(sel, this.nextElementSibling);
+      return el && fix(Ruler.runCHandler.default(el) || el.textContent);
     }
-
     function processTitle() {
       const el = $(qTitle, doc);
       return el && fix(el.getAttribute('content') || el.textContent) || '';
     }
-
     function $orSelf(selector, el) {
       if (el && !el.matches(qEntry))
         return el.matches(selector) ? el : $(selector, el);
@@ -1237,7 +1306,10 @@ const Popup = {
   async create(src, pageUrl, error) {
     const inGallery = !cfg.uiFadeinGallery && ai.gItems && ai.popup && !ai.zooming &&
       (ai.popup.dataset.galleryFlip = '') === '';
-    Popup.destroy();
+    if (!ai.gItems)
+      Popup.destroy();
+    else if (ai.blobUrl)
+      URL.revokeObjectURL(ai.blobUrl);
     ai.imageUrl = src;
     if (!src)
       return;
@@ -1252,24 +1324,33 @@ const Popup = {
     Object.assign(ai, {pageUrl, xhr});
     if (xhr)
       [src, isVideo] = await Req.getImage(src, pageUrl, xhr).catch(App.handleError) || [];
-    if (ai !== myAi || !src)
+    let vol;
+    if (ai !== myAi || !src || isVideo && (vol = await GM.getValue('volume'), ai !== myAi))
       return;
-    const p = ai.popup = isVideo ? await PopupVideo.create() : $create('img');
+    let p = ai.popup, blank;
+    if (p) {
+      p.src = blank = BLANK_PIXEL;
+      ai.popupShown = null;
+      ai.popupLoaded = false;
+    } else p = ai.popup = isVideo ? PopupVideo.create(vol) : $new('img');
     p.id = `${PREFIX}popup`;
     p.src = src;
     p.addEventListener('error', App.handleError);
+    if ((ai.night = (ai.night != null ? ai.night : cfg.night)))
+      p.classList.add(`${PREFIX}night`);
     if (ai.zooming)
       p.addEventListener('transitionend', Popup.onZoom);
-    if (inGallery) {
-      p.dataset.galleryFlip = '';
-      p.setAttribute('loaded', '');
-    }
-    doc.body.insertBefore(p, ai.bar || undefined);
+    $dataset(p, 'galleryFlip', inGallery);
+    p.toggleAttribute('loaded', inGallery);
+    const poo = ai.popover || typeof p.showPopover === 'function' && $('[popover]:popover-open');
+    ai.popover = poo && poo.getBoundingClientRect().width && ($css(poo, {opacity: 0}), poo) || null;
+    if (p.parentElement !== doc.body)
+      doc.body.insertBefore(p, ai.bar && ai.bar.parentElement === doc.body && ai.bar || null);
     await 0;
-    if (App.checkProgress({start: true}) === false)
+    if (ai.popup !== p || App.checkProgress({start: true}) === false)
       return;
-    if (p.complete)
-      Popup.onLoad.call(ai.popup);
+    if (!blank && p.complete)
+      Popup.onLoad.call(p);
     else if (!isVideo)
       p.addEventListener('load', Popup.onLoad, {once: true});
   },
@@ -1279,6 +1360,10 @@ const Popup = {
     if (!p) return;
     p.removeEventListener('load', Popup.onLoad);
     p.removeEventListener('error', App.handleError);
+    if (ai.popover) {
+      ai.popover.style.removeProperty('opacity');
+      ai.popover = null;
+    }
     if (isFunction(p.pause))
       p.pause();
     if (ai.blobUrl)
@@ -1338,29 +1423,48 @@ const Popup = {
       this.setAttribute('loaded', '');
       ai.popupLoaded = true;
       Status.set('-loading');
-      if (ai.preloadUrl) {
-        $create('img', {src: ai.preloadUrl});
-        ai.preloadUrl = null;
-      }
+      let i = ai.gItem;
+      if (i) i.url = this.src;
+      if ((i = ai.gItemNext))
+        Popup.preload(this, i);
     }
   },
 
   onZoom() {
     this.classList.remove(`${PREFIX}zooming`);
   },
+
+  async preload(p, item, u = item.url, el = $new('img')) {
+    ai.gItemNext = null;
+    if (!isArray(u)) {
+      el.src = u;
+      return;
+    }
+    for (const arr = u; p === ai.popup && item.url === arr && (u = arr[0]);) {
+      const {type} = await new Promise(cb => {
+        el.src = u;
+        el.onload = el.onerror = cb;
+      });
+      if (arr[0] === u)
+        arr.shift();
+      if (type === 'load') {
+        item.url = u;
+        break;
+      }
+    }
+  },
 };
 
 const PopupVideo = {
-  async create() {
+  create(volume) {
     ai.bufBar = false;
     ai.bufStart = now();
-    const shouldMute = cfg.mute || new AudioContext().state === 'suspended';
-    return $create('video', {
-      autoplay: true,
-      controls: shouldMute,
-      muted: shouldMute,
+    return $new('video', {
+      autoplay: ai.preloadStart !== -1,
+      controls: true,
+      muted: cfg.mute || new AudioContext().state === 'suspended',
       loop: true,
-      volume: clamp(+await GM.getValue('volume') || .5, 0, 1),
+      volume: clamp(+volume || .5, 0, 1),
       onprogress: PopupVideo.progress,
       oncanplaythrough: PopupVideo.progressDone,
       onvolumechange: PopupVideo.rememberVolume,
@@ -1371,7 +1475,7 @@ const PopupVideo = {
     const {duration} = this;
     if (duration && this.buffered.length && now() - ai.bufStart > 2000) {
       const pct = Math.round(this.buffered.end(0) / duration * 100);
-      if ((ai.bufBar |= pct > 0 && pct < 50))
+      if (ai.bar && (ai.bufBar |= pct > 0 && pct < 50))
         Bar.set(`${pct}% of ${Math.round(duration)}s`, 'xhr');
     }
   },
@@ -1399,9 +1503,10 @@ const Ruler = {
 */
   init() {
     const errors = new Map();
-    const customRules = (cfg.hosts || []).map(Ruler.parse, errors);
+    /** @type mpiv.HostRule[] */
+    const rules = Ruler.rules = (cfg.hosts || []).map(Ruler.parse, errors).filter(Boolean);
     const hasGMAE = typeof GM_addElement === 'function';
-    const canEval = nonce || hasGMAE;
+    const canEval = nonce || (nonce = ($('script[nonce]') || {}).nonce || '') || hasGMAE;
     const evalId = canEval && `${GM_info.script.name}${Math.random()}`;
     const evalRules = [];
     const evalCode = [`window[${JSON.stringify(evalId)}]=[`];
@@ -1412,7 +1517,7 @@ const Ruler = {
       }
       if (canEval) {
         evalCode.push(evalRules.length ? ',' : '',
-          '[', customRules.indexOf(rule), ',{',
+          '[', rules.indexOf(rule), ',{',
           ...Object.keys(FN_ARGS)
             .map(k => RX_HAS_CODE.test(rule[k]) && `${k}(${FN_ARGS[k]}){${rule[k]}},`)
             .filter(Boolean),
@@ -1425,9 +1530,9 @@ const Ruler = {
       if (canEval) {
         const GMAE = hasGMAE
           ? GM_addElement // eslint-disable-line no-undef
-          : (tag, {textContent}) => document.head.appendChild(
+          : (tag, {textContent: txt}) => document.head.appendChild(
             Object.assign(document.createElement(tag), {
-              textContent: TRUSTED.createScript(textContent),
+              textContent: trustedScript ? trustedScript(txt) : txt,
               nonce,
             }));
         evalCode.push(']; document.currentScript.remove();');
@@ -1436,55 +1541,48 @@ const Ruler = {
           isFF && (wnd = wnd.wrappedJSObject)[evalId];
       }
       if (result) {
-        for (const [index, fns] of result) {
-          Object.assign(customRules[index], fns);
-        }
+        for (const [index, fns] of result)
+          Object.assign(rules[index], fns);
         delete wnd[evalId];
       } else {
         console.warn('Site forbids compiling JS code in these custom rules', evalRules);
       }
     }
 
-    // rules that disable previewing
-    const disablers = [
-      dotDomain.endsWith('.stackoverflow.com') && {
-        e: '.post-tag, .post-tag img',
-        s: '',
-      },
-    ];
-
     // optimization: a rule is created only when on domain
-    const perDomain = [
-      hostname.includes('startpage') && {
-        r: /\boiu=(.+)/,
-        s: '$1',
-        follow: true,
-      },
-      dotDomain.endsWith('.4chan.org') && {
+    switch (dotDomain.match(/[^.]+(?=\.com?(?:\.[^.]+)?$)|[^.]+\.[^.]+$|$/)[0]) {
+
+      case '4chan.org': rules.push({
         e: '.is_catalog .thread a[href*="/thread/"], .catalog-thread a[href*="/thread/"]',
         q: '.op .fileText a',
         css: '#post-preview{display:none}',
-      },
-      hostname.includes('amazon.') && {
+      }); break;
+
+      case 'amazon': rules.push({
         r: /.+?images\/I\/.+?\./,
         s: m => {
           const uh = doc.getElementById('universal-hover');
           return uh ? '' : m[0] + 'jpg';
         },
         css: '#zoomWindow{display:none!important;}',
-      },
-      dotDomain.endsWith('.bing.com') && {
+      }); break;
+
+      case 'bing': rules.push({
         e: 'a[m*="murl"]',
         r: /murl&quot;:&quot;(.+?)&quot;/,
         s: '$1',
         html: true,
-      },
-      ...dotDomain.endsWith('.deviantart.com') && [{
-        e: '[data-super-full-img] *, img[src*="/th/"]',
-        s: (m, node) =>
-          $propUp(node, 'data-super-full-img') ||
-          (node = node.dataset.embedId && node.nextElementSibling) &&
-          node.dataset.embedId && node.src,
+      }); break;
+
+      case 'deviantart': rules.push({
+        e: 'a[href*="/art/"] img[src*="/v1/"]',
+        r: /^(.+)\/v1\/\w+\/[^/]+\/(.+)-\d+.(\.\w+)(\?.+)/,
+        s: ([, base, name, ext, tok], node) => {
+          let v = Util.getReactChildren(node.closest('a'), 'props.deviation.media.types');
+          return v && (v = v.find(t => t.t === 'fullview')) && `${base}${
+            v.c ? v.c.replace('<prettyName>', name)
+              : `/v1/fill/w_${v.w},h_${v.h}/${name}-fullview${ext}`}${tok}`;
+        },
       }, {
         e: '.dev-view-deviation img',
         s: () => [
@@ -1494,34 +1592,27 @@ const Ruler = {
       }, {
         e: 'a[data-hook=deviation_link]',
         q: 'link[as=image]',
-      }] || [],
-      dotDomain.endsWith('.discord.com') && {
+      }); break;
+
+      case 'discord': rules.push({
         u: '||discordapp.net/external/',
         r: /\/https?\/(.+)/,
         s: '//$1',
         follow: true,
-      },
-      dotDomain.endsWith('.dropbox.com') && {
+      }); break;
+
+      case 'dropbox': rules.push({
         r: /(.+?&size_mode)=\d+(.*)/,
         s: '$1=5$2',
-      },
-      dotDomain.endsWith('.facebook.com') && {
-        e: 'a[href*="ref=hovercard"]',
-        s: (m, node) =>
-          'https://www.facebook.com/photo.php?fbid=' +
-          /\/[0-9]+_([0-9]+)_/.exec($('img', node).src)[1],
-        follow: true,
-      },
-      dotDomain.endsWith('.facebook.com') && {
-        r: /(fbcdn|external).*?(app_full_proxy|safe_image).+?(src|url)=(http.+?)[&"']/,
-        s: (m, node) =>
-          node.parentNode.className.includes('video') && m[4].includes('fbcdn') ? '' :
-            decodeURIComponent(m[4]),
-        html: true,
-        follow: true,
-      },
-      dotDomain.endsWith('.flickr.com') &&
-      pick(unsafeWindow, 'YUI_config.flickr.api.site_key') && {
+      }); break;
+
+      case 'facebook': rules.push({
+        e: 'a[href^="/photo/?"], a[href^="https://www.facebook.com/photo"]',
+        s: (m, el) => (m = Util.getReactChildren(el.parentNode)) &&
+          pick(m, (m[0] ? '0.props.linkProps' : 'props') + '.passthroughProps.origSrc'),
+      }); break;
+
+      case 'flickr': if (pick(unsafeWindow, 'YUI_config.flickr.api.site_key')) rules.push({
         r: /flickr\.com\/photos\/[^/]+\/(\d+)/,
         s: m => `https://www.flickr.com/services/rest/?${
           new URLSearchParams({
@@ -1533,25 +1624,28 @@ const Ruler = {
           }).toString()}`,
         q: text => JSON.parse(text).sizes.size.pop().source,
         anonymous: true,
-      },
-      dotDomain.endsWith('.github.com') && {
+      }); break;
+
+      case 'github': rules.push({
         r: new RegExp([
           /(avatars.+?&s=)\d+/,
           /(raw\.github)(\.com\/.+?\/img\/.+)$/,
-          /\/(github)(\.com\/.+?\/)blob\/([^/]+\/.+?\.(?:png|jpe?g|bmp|gif|cur|ico))$/,
+          /\/(github)(\.com\/.+?\/)blob\/([^/]+\/.+?\.(?:avif|webp|png|jpe?g|bmp|gif|cur|ico|svg))$/,
         ].map(rx => rx.source).join('|')),
         s: m => `https://${
           m[1] ? `${m[1]}460` :
             m[2] ? `${m[2]}usercontent${m[3]}` :
-              `raw.${m[4]}usercontent${m[5]}${m[6]}`
+              $('.AppHeader-context-item > .octicon-lock')
+                ? `${m[4]}${m[5]}raw/${m[6]}`
+                : `raw.${m[4]}usercontent${m[5]}${m[6]}`
         }`,
-      },
-      isGoogleImages && {
+      }); break;
+
+      case 'google': if (/[&?]tbm=isch(&|$)/.test(location.search)) rules.push({
         e: 'a[href*="imgres?imgurl="] img',
         s: (m, node) => new URLSearchParams(node.closest('a').search).get('imgurl'),
         follow: true,
-      },
-      isGoogleImages && {
+      }, {
         e: '[data-tbnid] a:not([href])',
         s: (m, a) => {
           const a2 = $('a[jsaction*="mousedown"]', a.closest('[data-tbnid]')) || a;
@@ -1565,16 +1659,17 @@ const Ruler = {
           a2.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
           a2.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
         },
-      },
-      dotDomain.endsWith('.instagram.com') && {
+      }); break;
+
+      case 'instagram': rules.push({
         e: 'a[href*="/p/"],' +
           'article [role="button"][tabindex="0"],' +
           'article [role="button"][tabindex="0"] div',
         s: (m, node, rule) => {
           let data, a, n, img, src;
-          if (location.pathname.startsWith('/p/')) {
+          if (location.pathname.startsWith('/p/') || location.pathname.startsWith('/tv/')) {
             img = $('img[srcset], video', node.parentNode);
-            if (img && (img.localName === 'video' || parseFloat(img.sizes) > 900))
+            if (img && (isVideo(img) || parseFloat(img.sizes) > 900))
               src = (img.srcset || img.currentSrc).split(',').pop().split(' ')[0];
           }
           if (!src && (n = node.closest('a[href*="/p/"], article'))) {
@@ -1589,7 +1684,7 @@ const Ruler = {
           rule._img = img;
           return (
             !a && !src ? false :
-              !data || rule.q || rule.g ? `${src || a.href}${rule.g ? '?__a=1' : ''}` :
+              !data || rule.q || rule.g ? `${src || a.href}${rule.g ? '?__a=1&__d=dis' : ''}` :
                 data.video_url || data.display_url);
         },
         c: (html, doc, node, rule) =>
@@ -1600,21 +1695,22 @@ const Ruler = {
           const json = tryJSON(text);
           const media =
             pick(json, 'graphql.shortcode_media') ||
-            pick(json, 'items[0]');
+            pick(json, 'items.0');
           const items =
             pick(media, 'edge_sidecar_to_children.edges', res => res.map(e => ({
               url: e.node.video_url || e.node.display_url,
             }))) ||
             pick(media, 'carousel_media', res => res.map(e => ({
-              url: pick(e, 'video_versions[0].url') || pick(e, 'image_versions2.candidates[0].url'),
+              url: pick(e, 'video_versions.0.url') || pick(e, 'image_versions2.candidates.0.url'),
             })));
           items.title = rule._getCaption(media) || '';
           return items;
         },
         _getCaption: data => pick(data, 'caption.text') ||
-          pick(data, 'edge_media_to_caption.edges[0].node.text'),
-      },
-      ...dotDomain.endsWith('.reddit.com') && [{
+          pick(data, 'edge_media_to_caption.edges.0.node.text'),
+      }); break;
+
+      case 'reddit': rules.push({
         u: '||i.reddituploads.com/',
       }, {
         e: '[data-url*="i.redd.it"] img[src*="thumb"]',
@@ -1622,25 +1718,33 @@ const Ruler = {
       }, {
         r: /preview(\.redd\.it\/\w+\.(jpe?g|png|gif))/,
         s: 'https://i$1',
-      }] || [],
-      dotDomain.endsWith('.tumblr.com') && {
+      }); break;
+
+      case 'stackoverflow': rules.push({
+        e: '.post-tag, .post-tag img',
+        s: '',
+      }); break;
+
+      case 'startpage': rules.push({
+        r: /[&?]piurl=([^&]+)/,
+        s: '$1',
+        follow: true,
+      }); break;
+
+      case 'tumblr': rules.push({
         e: 'div.photo_stage_img, div.photo_stage > canvas',
         s: (m, node) => /http[^"]+/.exec(node.style.cssText + node.getAttribute('data-img-src'))[0],
         follow: true,
-      },
-      dotDomain.endsWith('.tweetdeck.twitter.com') && {
-        e: 'a.media-item, a.js-media-image-link',
-        s: (m, node) => /http[^)]+/.exec(node.style.backgroundImage)[0],
-        follow: true,
-      },
-      dotDomain.endsWith('.twitter.com') && {
+      }); break;
+
+      case 'twitter': rules.push({
         e: '.grid-tweet > .media-overlay',
         s: (m, node) => node.previousElementSibling.src,
         follow: true,
-      },
-    ];
+      }); break;
+    }
 
-    const main = [
+    rules.push(
       {
         r: /[/?=](https?%3A%2F%2F[^&]+)/i,
         s: '$1',
@@ -1701,50 +1805,15 @@ const Ruler = {
       },
       {
         u: '||fastpic.',
-        e: 'a[href*="fastpic"]',
-        s: m => m[0].replace('http:', 'https:').replace('fastpic.ru', 'fastpic.org'),
-        q: 'img[src*="/big/"]',
-      },
-      {
-        u: '||facebook.com/',
-        r: /photo\.php|[^/]+\/photos\//,
-        s: (m, node) =>
-          node.id === 'fbPhotoImage' ? false :
-            /gradient\.png$/.test(m.input) ? '' :
-              m.input.replace('www.facebook.com', 'mbasic.facebook.com'),
-        q: [
-          'div + span > a:first-child:not([href*="tag_faces"])',
-          'div + span > a[href*="tag_faces"] ~ a',
-        ],
-        rect: '#fbProfileCover',
-      },
-      {
-        u: '||fbcdn.',
-        r: /fbcdn.+?[0-9]+_([0-9]+)_[0-9]+_[a-z]\.(jpg|png)/,
-        s: m =>
-          dotDomain.endsWith('.facebook.com') &&
-          tryCatch(() => unsafeWindow.PhotoSnowlift.getInstance().stream.cache.image[m[1]].url) ||
-          false,
-        manual: true,
-      },
-      {
-        u: ['||fbcdn-', 'fbcdn.net/'],
-        r: /(https?:\/\/(fbcdn-[-\w.]+akamaihd|[-\w.]+?fbcdn)\.net\/[-\w/.]+?)_[a-z]\.(jpg|png)(\?[0-9a-zA-Z0-9=_&]+)?/,
         s: (m, node) => {
-          if (node.id === 'fbPhotoImage') {
-            const a = $('a.fbPhotosPhotoActionsItem[href$="dl=1"]', doc.body);
-            if (a) return a.href.includes(m.input.match(/[0-9]+_[0-9]+_[0-9]+/)[0]) ? '' : a.href;
-          }
-          if (m[4])
-            return false;
-          const pn = node.parentNode;
-          if (pn.outerHTML.includes('/hovercard/'))
-            return '';
-          if (node.outerHTML.includes('profile') && pn.parentNode.href.includes('/photo'))
-            return false;
-          return m[1].replace(/\/[spc][\d.x]+/g, '').replace('/v/', '/') + '_n.' + m[3];
+          const a = node.closest('a');
+          const url = decodeURIComponent(Req.findImageUrl(a || node))
+            .replace(/\/i(\d+)\.(\w+\.\w+\/)\w+/, '/$2$1')
+            .replace(/^\w+:\/\/fastpic[^/]+((?:\/\d+){3})\/\w+(\/\w+\.\w+).*/,
+              'https://fastpic.org/view$1$2.html');
+          return a || url.includes('.png') ? url : [url, url.replace(/\.jpe?g/, '.png')];
         },
-        rect: '.photoWrap',
+        q: 'img[src*="/big/"]',
       },
       {
         u: '||flickr.com/photos/',
@@ -1796,7 +1865,7 @@ const Ruler = {
         u: '//gyazo.com/',
         r: /\bgyazo\.com\/\w{32,}(\.\w+)?/,
         s: (m, _, rule) => Ruler.toggle(rule, 'q', !m[1]) ? m.input : `https://i.${m[0]}`,
-        _q: 'meta[name="twitter:image"]',
+        _q: 'link[rel="image_src"]',
       },
       {
         u: '||hostingkartinok.com/show-image.php',
@@ -1811,10 +1880,14 @@ const Ruler = {
         s: 'https://imagecurl.com/images/$1$2$3',
       },
       {
-        u: '||imagebam.com/image/',
-        q: 'meta[property="og:image"]',
-        tabfix: true,
-        xhr: hostname.includes('planetsuzy'),
+        u: '||imagebam.com/',
+        r: /^(https:\/\/)thumbs\d+(\.imagebam\.com\/).*?([^/]+)_t\./,
+        s: '$1www$2view/$3',
+        q: 'img.main-image',
+      },
+      {
+        u: '||www.imagebam.com/view/',
+        q: 'img.main-image',
       },
       {
         u: '||imageban.ru/thumbs',
@@ -1905,7 +1978,7 @@ const Ruler = {
           '||imgur.com/gallery/',
         ],
         s: 'gallery', // suppressing an unused network request for remote `document`
-        g: async (text, doc, url, m, rule, node, cb) => {
+        async g() {
           let u = `https://imgur.com/ajaxalbums/getimages/${ai.url.split(/[/?#]/)[4]}/hit.json?all=true`;
           let info = tryJSON((await Req.gmXhr(u)).responseText) || 0;
           let images = (info.data || 0).images || [];
@@ -1929,9 +2002,8 @@ const Ruler = {
           }
           if (items[0] && info.title && !`${items[0].desc || ''}`.includes(info.title))
             items.title = info.title;
-          cb(items);
+          return items;
         },
-        css: '.post > .hover { display:none!important; }',
       },
       {
         u: '||imgur.com/',
@@ -1964,21 +2036,23 @@ const Ruler = {
         u: [
           '||instagr.am/p/',
           '||instagram.com/p/',
+          '||instagram.com/tv/',
         ],
-        s: m => m.input.substr(0, m.input.lastIndexOf('/')).replace('/liked_by', '') + '/?__a=1',
+        s: m => m.input.substr(0, m.input.lastIndexOf('/')).replace('/liked_by', '') +
+        '/?__a=1&__d=dis',
         q: m => (m = tryJSON(m)) && (
-          m = pick(m, 'graphql.shortcode_media') || pick(m, 'items[0]') || 0
+          m = pick(m, 'graphql.shortcode_media') || pick(m, 'items.0') || 0
         ) && (
           m.video_url ||
           m.display_url ||
-          pick(m, 'video_versions[0].url') ||
-          pick(m, 'carousel_media[0].image_versions2.candidates[0].url') ||
-          pick(m, 'image_versions2.candidates[0].url')
+          pick(m, 'video_versions.0.url') ||
+          pick(m, 'carousel_media.0.image_versions2.candidates.0.url') ||
+          pick(m, 'image_versions2.candidates.0.url')
         ),
         rect: 'div.PhotoGridMediaItem',
         c: m => (m = tryJSON(m)) && (
-          pick(m, 'items[0].caption.text') ||
-          pick(m, 'graphql.shortcode_media.edge_media_to_caption.edges[0].node.text') ||
+          pick(m, 'items.0.caption.text') ||
+          pick(m, 'graphql.shortcode_media.edge_media_to_caption.edges.0.node.text') ||
           ''
         ),
       },
@@ -2089,10 +2163,9 @@ const Ruler = {
       },
       {
         u: '||wiki',
-        r: /\/(thumb|images)\/.+\.(jpe?g|gif|png|svg)\/(revision\/)?/i,
-        s: '/\\/thumb(?=\\/)|' +
-           '\\/scale-to-width(-[a-z]+)?\\/[0-9]+|' +
-           '\\/revision\\/latest|\\/[^\\/]+$//g',
+        r: /\/(?:thumb|images)\/.+\.(?:jpe?g|gif|png|svg)/i,
+        s: m => m.input.replace(/\/(thumb(?=\/)|\d+px[^/]+(?=$|\?))/g, '')
+          .replace(/\/(scale-to-width(-[a-z]+)?\/\d+|(zoom-crop|smart)(\/(width|height)\/\d+)+)/g, '/'),
         xhr: !hostname.includes('wiki'),
       },
       {
@@ -2124,15 +2197,8 @@ const Ruler = {
       },
       {
         r: RX_MEDIA_URL,
-      },
-    ];
-
-    /** @type mpiv.HostRule[] */
-    (Ruler.rules = [].concat(customRules, disablers, perDomain, main).filter(Boolean))
-      .forEach(rule => {
-        if (Array.isArray(rule.e))
-          rule.e = rule.e.join(',');
-      });
+      }
+    );
   },
 
   format(rule, {expand} = {}) {
@@ -2169,20 +2235,17 @@ const Ruler = {
         rule.d = undefined;
       else if (isBatchOp && rule.d && !hostname.includes(rule.d))
         return false;
-      if ('e' in rule) {
-        let {e} = rule;
-        if (typeof e === 'string') {
-          e = e.trim();
-        } else if (
-          Array.isArray(e) && !e.every((s, i) => typeof s === 'string' && (e[i] = s.trim())) ||
-          e && !Object.entries(e).filter(Ruler.isValidE2).length
-        ) {
+      let {e} = rule;
+      if (e != null) {
+        e = typeof e === 'string' ? e.trim()
+          : isArray(e) ? e.join(',').trim()
+            : Object.entries(e).every(Ruler.isValidE2) && e;
+        if (!e)
           throw new Error('Invalid syntax for "e". Examples: ' +
             '"e": ".image" or ' +
             '"e": [".image1", ".image2"] or ' +
             '"e": {".parent": ".image"} or ' +
             '"e": {".parent1": ".image1", ".parent2": ".image2"}');
-        }
         if (isBatchOp) rule.e = e || undefined;
       }
       let compileTo = isBatchOp ? rule : {};
@@ -2226,21 +2289,21 @@ const Ruler = {
         el.getAttribute('title') ||
         el.textContent;
     },
-    default: () =>
+    default: (text, doc, el = ai.node) =>
       (ai.tooltip || 0).text ||
-      ai.node.alt ||
-      $propUp(ai.node, 'title') ||
+      el.alt ||
+      $propUp(el, 'title') ||
       Req.getFileName(
-        ai.node.tagName === (ai.popup || 0).tagName
+        el.tagName === (ai.popup || 0).tagName
           ? ai.url
-          : ai.node.src || $propUp(ai.node, 'href')),
+          : el.src || $propUp(el, 'href')),
   },
 
   runQ(text, doc, docUrl) {
     let url;
     if (isFunction(ai.rule.q)) {
       url = ai.rule.q(text, doc, ai.node, ai.rule);
-      if (Array.isArray(url)) {
+      if (isArray(url)) {
         ai.urls = url.slice(1);
         url = url[0];
       }
@@ -2252,10 +2315,7 @@ const Ruler = {
   },
 
   /** @returns {?boolean|mpiv.RuleMatchInfo} */
-  runE(rule, node) {
-    const {e} = rule;
-    if (typeof e === 'string')
-      return node.matches(e);
+  runE(rule, e, node) {
     let p, img, res, info;
     for (const selParent in e) {
       if ((p = node.closest(selParent)) && (img = $(e[selParent], p))) {
@@ -2270,7 +2330,7 @@ const Ruler = {
 
   /** @returns {?Array} if falsy then the rule should be skipped */
   runS(node, rule, m) {
-    let urls = [];
+    let urls = [], u;
     for (const s of ensureArray(rule.s))
       urls.push(
         typeof s === 'string' ? Util.decodeUrl(Ruler.substituteSingle(s, m)) :
@@ -2280,10 +2340,10 @@ const Ruler = {
       console.warn('Rule discarded: "s" array is not allowed with "q"\n%o', rule);
       return;
     }
-    if (Array.isArray(urls[0]))
-      urls = urls[0];
-    // `false` returned by "s" property means "skip this rule", "" means "stop all rules"
-    return urls[0] !== false && Array.from(new Set(urls), Util.decodeUrl);
+    if (isArray(u = urls[0]))
+      u = [urls = u][0];
+    return u === '' /* "stop all rules" */ ? urls
+      : u && arrayFrom(new Set(urls), Util.decodeUrl);
   },
 
   /** @returns {boolean} */
@@ -2325,7 +2385,7 @@ const RuleMatcher = {
   /** @returns {Object} */
   adaptiveFind(node, opts) {
     const tn = node.tagName;
-    const src = node.currentSrc || node.src;
+    const src = node.currentSrc || node.src || '';
     const isPic = tn === 'IMG' || tn === 'VIDEO' && Util.isVideoUrlExt(src);
     let a, info, url;
     // note that data URLs aren't passed to rules as those may have fatally ineffective regexps
@@ -2347,35 +2407,33 @@ const RuleMatcher = {
 
   /** @returns ?mpiv.RuleMatchInfo */
   find(url, node, {noHtml, rules, skipRules} = {}) {
-    const tn = node.tagName;
-    const isPic = tn === 'IMG' || tn === 'VIDEO';
-    const isPicOrLink = isPic || tn === 'A';
-    let m, html, info;
+    let tn, isPic, html, h;
     for (const rule of rules || Ruler.rules) {
+      let e, m;
       if (skipRules && skipRules.includes(rule) ||
           rule.u && (!url || !Ruler.runU(rule, url)) ||
-          rule.e && !rules && !(info = Ruler.runE(rule, node)))
+          !rules && (e = rule.e) &&
+            !(m = typeof e === 'string' ? node.matches(e) : Ruler.runE(rule, e, node)))
         continue;
-      if (info && info.url)
-        return info;
-      if (rule.r)
-        m = !noHtml && rule.html && (isPicOrLink || rule.e)
-          ? rule.r.exec(html || (html = node.outerHTML))
-          : url && rule.r.exec(url);
-      else if (url)
-        m = Object.assign([url], {index: 0, input: url});
-      else
-        m = [];
+      if (m && m.url)
+        return m;
+      const {r, s} = rule;
+      let hasS = s != null;
+      h = !noHtml && (r || hasS) && rule.html && (html || (html = node.outerHTML));
+      if (r) {
+        m = h ? r.exec(h) : url && r.exec(url);
+      } else {
+        m = ['']; m[0] = m.input = h || url || ''; m.index = 0;
+      }
       if (!m)
         continue;
-      if (rule.s === '')
+      if (s === '')
         return {};
-      let hasS = rule.s != null;
       // a rule with follow:true for the currently hovered IMG produced a URL,
       // but we'll only allow it to match rules without 's' in the nested find call
-      if (isPic && !hasS && !skipRules)
+      if (!hasS && !skipRules && (tn ? isPic : isPic = (tn = node.tagName) === 'IMG' || tn === 'VIDEO'))
         continue;
-      hasS &= rule.s !== 'gallery';
+      hasS &= s !== 'gallery';
       const urls = hasS ? Ruler.runS(node, rule, m) : [m.input];
       if (urls)
         return RuleMatcher.makeInfo(hasS, rule, m, node, skipRules, urls);
@@ -2419,7 +2477,7 @@ const Req = {
 
   gmXhr(url, opts = {}) {
     if (ai.req)
-      tryCatch.call(ai.req, ai.req.abort);
+      tryCatch(ai.req.abort);
     return new Promise((resolve, reject) => {
       const {anonymous} = ai.rule || {};
       ai.req = GM.xmlHttpRequest(Object.assign({
@@ -2550,7 +2608,7 @@ const Req = {
     if (!name.includes('.'))
       name += '.jpg';
     if (url.startsWith('blob:') || url.startsWith('data:')) {
-      $create('a', {href: url, download: name})
+      $new('a', {href: url, download: name})
         .dispatchEvent(new MouseEvent('click'));
     } else {
       Status.set('+loading');
@@ -2784,7 +2842,7 @@ const Util = {
   addStyle(name, css) {
     const id = `${PREFIX}style:${name}`;
     const el = doc.getElementById(id) ||
-               css && $create('style', {id});
+               css && $new('style', {id});
     if (!el) return;
     if (el.textContent !== css)
       el.textContent = css;
@@ -2820,8 +2878,8 @@ const Util = {
   deepEqual(a, b) {
     if (!a || !b || typeof a !== 'object' || typeof a !== typeof b)
       return a === b;
-    if (Array.isArray(a)) {
-      return Array.isArray(b) &&
+    if (isArray(a)) {
+      return isArray(b) &&
         a.length === b.length &&
         a.every((v, i) => Util.deepEqual(v, b[i]));
     }
@@ -2838,33 +2896,33 @@ const Util = {
   },
 
   formatError(e, rule) {
-    const message =
-      e.message ||
+    const msg = e.message;
+    const {url: u, imageUrl: iu} = ai;
+    e = msg ? e :
       e.readyState && 'Request failed.' ||
       e.type === 'error' && `File can't be displayed.${
         $('div[bgactive*="flashblock"]', doc) ? ' Check Flashblock settings.' : ''
       }` ||
       e;
-    const m = [
-      [`${GM_info.script.name}: %c${message}%c`, 'font-weight:bold'],
-      ['', 'font-weight:normal'],
-    ];
-    m.push(...[
-      ['Node: %o', ai.node],
-      ['Rule: %o', rule],
-      ai.url && ['URL: %s', ai.url],
-      ai.imageUrl && ai.imageUrl !== ai.url && ['File: %s', ai.imageUrl],
-    ].filter(Boolean));
-    return {
-      message,
-      consoleFormat: m.map(([k]) => k).filter(Boolean).join('\n'),
-      consoleArgs: m.map(([, v]) => v),
-    };
+    let fmt;
+    const res = [
+      fmt = '%c%s%c', 'font-weight:bold', e, 'font-weight:normal',
+      (fmt += '\nNode: %o', ai.node),
+      (fmt += '\nRule: %o', rule),
+      u && (fmt += '\nURL: %s', u),
+      iu && iu !== u && (fmt += '\nFile: %s', iu),
+      e.stack,
+    ].filter(Boolean);
+    res[0] = fmt;
+    res.message = msg || e;
+    return res;
   },
 
-  isHovered(el) {
-    // doesn't work in image tabs, browser bug?
-    return App.isImageTab || el.closest(':hover');
+  getReactChildren(el, path) {
+    if (isFF) el = el.wrappedJSObject || el;
+    for (const k of Object.keys(el))
+      if (typeof k === 'string' && k.startsWith('__reactProps'))
+        return (el = el[k].children) && (path ? pick(el, path) : el);
   },
 
   isVideoUrl: url => url.startsWith('data:video') || Util.isVideoUrlExt(url),
@@ -2873,7 +2931,11 @@ const Util = {
 
   newFunction(...args) {
     try {
-      return App.NOP || new Function(...args);
+      return App.NOP || (trustedScript
+        // eslint-disable-next-line no-eval
+        ? window.eval(trustedScript(`(function anonymous(${args.slice(0, -1).join(',')}){${args.slice(-1)[0]}})`))
+        : new Function(...args)
+      );
     } catch (e) {
       if (!RX_EVAL_BLOCKED.test(e.message))
         throw e;
@@ -2916,8 +2978,8 @@ const Util = {
   },
 
   tabFixUrl() {
-    return ai.rule.tabfix && ai.popup.tagName === 'IMG' && !ai.xhr &&
-           navigator.userAgent.includes('Gecko/') &&
+    const {tabfix = App.tabfix} = ai.rule;
+    return tabfix && ai.popup.tagName === 'IMG' && !ai.xhr &&
            flattenHtml(`data:text/html;charset=utf8,
       <style>
         body {
@@ -2956,36 +3018,56 @@ async function setup({rule} = {}) {
   }
   const RULE = setup.RULE || (setup.RULE = Symbol('rule'));
   let uiCfg;
-  let root = (elConfig || 0).shadowRoot;
+  let root = (elSetup || 0).shadowRoot;
   let {blankRuleElement} = setup;
-  /** @type NodeList */
-  const UI = new Proxy({}, {
+  let mover, moveX = 0, moveY = 0, moveBaseX = 0, moveBaseY = 0;
+  /** @type {{[id:string]: HTMLElement}} */
+  const UI = setup.UI = new Proxy({}, {
     get(_, id) {
       return root.getElementById(id);
     },
   });
-  if (!rule || !elConfig)
-    init(await Config.load({save: true}));
+  if (!elSetup)
+    build();
+  init(await Config.load({save: true}));
+  if (elSetup.parentElement !== doc.body)
+    doc.body.append(elSetup);
   if (rule)
     installRule(rule);
 
+  function build() {
+    elSetup = $new('div', {contentEditable: true});
+    root = elSetup.attachShadow({mode: 'open'});
+    root.append(...createSetupElement());
+    initEvents();
+  }
+
   function init(data) {
     uiCfg = data;
-    $remove(elConfig);
-    elConfig = $create('div', {contentEditable: true});
-    root = elConfig.attachShadow({mode: 'open'});
-    root.innerHTML = TRUSTED.createHTML(createConfigHtml());
-    initEvents();
     renderAll();
-    renderCustomScales();
+    renderVolatiles();
     renderRules();
-    doc.body.appendChild(elConfig);
     requestAnimationFrame(() => {
-      UI.css.style.minHeight = clamp(UI.css.scrollHeight, 40, elConfig.clientHeight / 4) + 'px';
+      UI.css.style.minHeight = clamp(UI.css.scrollHeight, 40, elSetup.clientHeight / 4) + 'px';
     });
   }
 
   function initEvents() {
+    UI._mover.onmousedown = e => {
+      if (e.button || eventModifiers(e))
+        return;
+      if (!mover) {
+        mover = UI._cssSetup.sheet;
+        mover.insertRule(':host {}');
+        mover = mover.cssRules[1];
+      }
+      addEventListener('mousemove', onMove, true);
+      addEventListener('mouseup', onMoveDone, true);
+      addEventListener('keydown', onMoveKey, true);
+      moveX = e.x - moveBaseX;
+      moveY = e.y - moveBaseY;
+      $css(mover, {opacity: .75});
+    };
     UI._apply.onclick = UI._cancel.onclick = UI._ok.onclick = UI._x.onclick = closeSetup;
     UI._export.onclick = e => {
       dropEvent(e);
@@ -3014,11 +3096,8 @@ async function setup({rule} = {}) {
       }
     };
     UI.start.onchange = function () {
-      UI.delay.closest('label').hidden =
-        UI.preload.closest('label').hidden =
-          this.value !== 'auto';
+      UI[PREFIX + 'setup'].dataset.start = this.value;
     };
-    UI.start.onchange();
     UI.xhr.onclick = ({target: el}) => el.checked || confirm($propUp(el, 'title'));
     // color
     for (const el of $$('[type="color"]', root)) {
@@ -3026,6 +3105,25 @@ async function setup({rule} = {}) {
       el.elSwatch = el.nextElementSibling;
       el.elOpacity = UI[el.id.replace('Color', 'Opacity')];
       el.elOpacity.elColor = el;
+    }
+    function onMove({x, y}) {
+      x = moveBaseX = clamp(x - moveX, -innerWidth + CSS_SETUP_X * 4, elSetup.clientWidth - CSS_SETUP_X);
+      y = moveBaseY = clamp(y - moveY, 0, innerHeight - CSS_SETUP_X * 3);
+      $css(mover, {transform: `translate(${x}px, ${y}px)`});
+      UI._ul.style.maxHeight = `calc(100vh - ${CSS_SETUP_MAX_Y + y - CSS_SETUP_X}px)`;
+    }
+    function onMoveDone() {
+      removeEventListener('mousemove', onMove, true);
+      removeEventListener('mouseup', onMoveDone, true);
+      removeEventListener('keydown', onMoveKey, true);
+      $css(mover, {opacity: ''});
+    }
+    function onMoveKey(e) {
+      if (e.key === 'Escape' && !eventModifiers(e)) {
+        e.stopPropagation();
+        onMove({x: moveX, y: moveY});
+        onMoveDone();
+      }
     }
     function colorOnInput() {
       this.elSwatch.style.setProperty('--color',
@@ -3044,7 +3142,7 @@ async function setup({rule} = {}) {
     function rangeOnFocus() {
       if (this.elEdit) return;
       const {min, max, step, value} = this;
-      this.elEdit = $create('input', {
+      this.elEdit = $new('input', {
         value, min, max, step,
         className: 'range-edit',
         style: `left: ${this.offsetLeft}px; margin-top: ${this.offsetHeight + 1}px`,
@@ -3082,14 +3180,11 @@ async function setup({rule} = {}) {
       cfg = uiCfg = collectConfig({save: true, clone: isApply});
       Ruler.init();
       Menu.reRegisterAlt();
-      if (isApply) {
-        renderCustomScales();
-        UI._css.textContent = cfg._getCss();
-        return;
-      }
+      if (isApply)
+        return renderVolatiles();
     }
-    $remove(elConfig);
-    elConfig = null;
+    $remove(elSetup);
+    elSetup = null;
   }
 
   function collectConfig({save, clone} = {}) {
@@ -3207,8 +3302,9 @@ async function setup({rule} = {}) {
       search.oninput();
   }
 
-  function renderCustomScales() {
+  function renderVolatiles() {
     UI.scales.value = uiCfg.scales.join(' ').trim() || Config.DEFAULTS.scales.join(' ');
+    UI._css.textContent = cfg._getCss();
   }
 
   function renderAll() {
@@ -3221,6 +3317,7 @@ async function setup({rule} = {}) {
       Object.assign(el, {target: '_blank', rel: 'noreferrer noopener external'});
     UI.delay.valueAsNumber = uiCfg.delay / 1000;
     UI.scale.valueAsNumber = Math.round(clamp(uiCfg.scale - 1, 0, 1) * 100);
+    UI.start.onchange();
   }
 }
 
@@ -3233,31 +3330,36 @@ function setupClickedRule(event) {
   }
 }
 
+/** @this {HTMLButtonElement} */
 async function setupRuleInstaller(e) {
   dropEvent(e);
-  const parent = this.parentElement;
-  parent.children._installLoading.hidden = false;
-  this.remove();
+  const parent = setup.UI._rules2;
+  this.disabled = true;
+  this.textContent = 'Loading...';
   let rules;
 
   try {
-    rules = extractRules(await Req.getDoc(this.href));
-    const selector = $create('select', {
+    rules = extractRules(await Req.getDoc(this.parentElement.href));
+    this.textContent = 'Rules loaded.';
+    const el = $new('select', {
       size: 8,
       style: 'width: 100%',
-      ondblclick: e => e.target !== selector && maybeSetup(e),
+      ondblclick: e => e.target !== el && maybeSetup(e),
       onkeyup: e => e.key === 'Enter' && maybeSetup(e),
+    }, rules.map(renderRule));
+    const i = el.selectedIndex = findMatchingRuleIndex();
+    parent.append(
+      $new('div#_installHint', [
+        'Double-click the rule (or select and press Enter) to add it. ',
+        'Click ', $new('code', 'Apply'), ' or ', $new('code', 'OK'), ' to confirm.',
+      ]),
+      el
+    );
+    if (i) requestAnimationFrame(() => {
+      const optY = el.selectedOptions[0].offsetTop - el.offsetTop;
+      el.scrollTo(0, optY - el.offsetHeight / 2);
     });
-    selector.append(...rules.map(renderRule));
-    selector.selectedIndex = findMatchingRuleIndex();
-    parent.children._installLoading.remove();
-    parent.children._installHint.hidden = false;
-    parent.appendChild(selector);
-    requestAnimationFrame(() => {
-      const optY = selector.selectedOptions[0].offsetTop - selector.offsetTop;
-      selector.scrollTo(0, optY - selector.offsetHeight / 2);
-      selector.focus();
-    });
+    el.focus();
   } catch (e) {
     parent.textContent = 'Error loading rules: ' + (e.message || e);
   }
@@ -3294,7 +3396,7 @@ async function setupRuleInstaller(e) {
   }
 
   function renderRule([name, rule]) {
-    return $create('option', {
+    return $new('option', {
       textContent: name,
       title: Ruler.format(rule, {expand: true})
         .replace(/^{|\s*}$/g, '')
@@ -3323,21 +3425,19 @@ async function setupRuleInstaller(e) {
   }
 }
 
-function createConfigHtml() {
-  const MPIV_BASE_URL = 'https://github.com/tophf/mpiv/wiki/';
-  const scalesHint = 'Leave it empty and click Apply or OK to restore the default values.';
-  const trimLeft = s => s.trim().replace(/\n\s+/g, '\r');
-  return flattenHtml(`
-<style>
+const CSS_SETUP_X = 20;
+const CSS_SETUP_MAX_Y = 200;
+const CSS_SETUP = /*language=css*/ `
   :host {
     all: initial !important;
     position: fixed !important;
     z-index: 2147483647 !important;
-    top: 20px !important;
+    top: ${CSS_SETUP_X}px !important;
     right: 20px !important;
     padding: 1.5em !important;
     color: #000 !important;
-    background: #eee !important;
+    --bg: #eee;
+    background: var(--bg) !important;
     box-shadow: 5px 5px 25px 2px #000 !important;
     width: 33em !important;
     border: 1px solid black !important;
@@ -3347,11 +3447,15 @@ function createConfigHtml() {
   main {
     font: 12px/15px sans-serif;
   }
+  main:not([data-start=auto]) [data-start-auto] {
+    opacity: .5;
+  }
   table {
     text-align:left;
   }
   ul {
-    max-height: calc(100vh - 200px);
+    min-height: 430px;
+    max-height: calc(100vh - ${CSS_SETUP_MAX_Y}px);
     margin: 0 0 15px 0;
     padding: 0;
     list-style: none;
@@ -3469,13 +3573,14 @@ function createConfigHtml() {
   a {
     text-decoration: none;
     color: LinkText;
+    cursor: pointer;
   }
   a:hover {
     text-decoration: underline;
   }
   button {
-    padding: .2em 1em;
-    margin: 0 1em;
+    padding: .2em .5em;
+    margin-right: 1em;
   }
   kbd {
     padding: 1px 6px;
@@ -3488,6 +3593,9 @@ function createConfigHtml() {
   .column {
     display: flex;
     flex-direction: column;
+  }
+  .flex {
+    display: flex;
   }
   .highlight {
     animation: 2s fade-in cubic-bezier(0, .75, .25, 1);
@@ -3505,6 +3613,24 @@ function createConfigHtml() {
   .matching-domain {
     border-color: #56b8ff;
     background: #d7eaff;
+  }
+  #_mover {
+    cursor: move;
+    user-select: none;
+    position: absolute;
+    top: 0;
+    left: 8px;
+    right: 24px;
+    height: 24px;
+    text-align: center;
+    background: linear-gradient(transparent 10px, currentColor 10px, currentColor 11px, transparent 11px,
+      transparent 13px, currentColor 13px, currentColor 14px, transparent 14px);
+  }
+  #_mover::after {
+    content: 'MPIV ${GM.info.script.version}';
+    font: bold 150% sans;
+    background: var(--bg);
+    padding: 0 1ex;
   }
   #_x {
     position: absolute;
@@ -3524,12 +3650,29 @@ function createConfigHtml() {
     color: green;
     font-weight: bold;
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 2px;
+    bottom: 4px;
+    right: 26px;
   }
   #_installHint {
     color: green;
+  }
+  #_usage {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 1em;
+  }
+  #_usage th {
+    font-weight: normal;
+    padding-right: .5em;
+  }
+  #_usage tr:nth-last-child(n + 2) > :not(br) {
+    white-space: pre-line;
+    border-bottom: 1px dotted #8888;
+  }
+  #_usage kbd {
+    font-family: monospace;
+    font-weight: bold;
   }
   @keyframes fade-in {
     from { background-color: deepskyblue }
@@ -3538,7 +3681,7 @@ function createConfigHtml() {
   @media (prefers-color-scheme: dark) {
     :host {
       color: #aaa !important;
-      background: #333 !important;
+      --bg: #333 !important;
     }
     a {
       color: deepskyblue;
@@ -3614,187 +3757,233 @@ function createConfigHtml() {
       border: 2px solid transparent;
     }
   }
-</style>
-<style id="_css">${cfg._getCss()}</style>
-<main id="${PREFIX}setup">
-  <div id=_x>x</div>
-  <ul class=column>
-    <details style="margin: -1em 0 0">
-      <summary style="cursor:pointer; color:LinkText"><b>Click to view help & hotkeys</b></summary>
-      <table>
-        <tr><th>Activate</th><td>move mouse cursor over thumbnail</td></tr>
-        <tr><th>Deactivate</th><td>move cursor off thumbnail, or click, or zoom out fully</td></tr>
-        <tr><th>Prevent/freeze</th><td>hold down <kbd>Shift</kbd> while entering/leaving thumbnail</td></tr>
-        <tr><th>Force-activate<br>(for small pics)</th>
-          <td>hold <kbd>Alt</kbd> while entering image element</td></tr>
-        <tr><td>&nbsp;</td></tr>
-        <tr><th>Start zooming</th>
-          <td>configurable: automatic or via right-click / <kbd>Shift</kbd> while popup is visible</td></tr>
-        <tr><th>Zoom</th><td>mouse wheel</td></tr>
-        <tr><th>Rotate</th><td><kbd>9</kbd> <kbd>0</kbd> keys (left or right)</td></tr>
-        <tr><th>Flip/mirror</th><td><kbd>h</kbd> <kbd>v</kbd> keys (horizontally or vertically)</td></tr>
-        <tr><th>Previous/next<br>in album</th>
-          <td>mouse wheel, <kbd>j</kbd> <kbd>k</kbd> or <kbd>←</kbd> <kbd>→</kbd> keys</td></tr>
-        <tr><td>&nbsp;</td></tr>
-      </table>
-      <table>
-        <tr><th>Antialiasing on/off</th><td><kbd>a</kbd></td><td rowspan=4>key while popup is visible</td></tr>
-        <tr><th>Copy URL</th><td><kbd>u</kbd></td></tr>
-        <tr><th>Copy image</th><td><kbd>y</kbd></td></tr>
-        <tr><th>Download</th><td><kbd>d</kbd></td></tr>
-        <tr><th>Mute/unmute</th><td><kbd>m</kbd></td></tr>
-        <tr><th>Open in tab</th><td><kbd>t</kbd></td></tr>
-      </table>
-    </details>
-    <li class="options stretch">
-      <label>Popup shows on
-        <select id=start>
-          <option value=context>Right-click / &#8801; / Alt
-          <option value=contextMK>Right-click / &#8801;
-          <option value=contextM>Right-click
-          <option value=contextK title="&#8801; is the Menu key (near the right Ctrl)">&#8801; key
-          <option value=alt>Alt
-          <option value=auto>automatically
-        </select>
-      </label>
-      <label>after, sec<input id=delay type=number min=0.05 max=10 step=0.05 title=seconds></label>
-      <label title="(if the full version of the hovered image is ...% larger)">
-        if larger, %<input id=scale type=number min=0 max=100 step=1>
-      </label>
-      <label>Zoom activates on
-        <select id=zoom>
-          <option value=context>Right click / Shift
-          <option value=wheel>Wheel up / Shift
-          <option value=shift>Shift
-          <option value=auto>automatically
-        </select>
-      </label>
-      <label>...and zooms to
-        <select id=fit>
-          <option value=all>fit to window
-          <option value=large>fit if larger
-          <option value=no>100%
-          <option value="" title="Use custom scale factors">custom
-        </select>
-      </label>
-    </li>
-    <li class=options>
-      <label>Zoom step, %<input id=zoomStep type=number min=100 max=400 step=1>
-      </label>
-      <label>When fully zoomed out:
-        <select id=zoomOut>
-          <option value=stay>stay in zoom mode
-          <option value=auto>stay if still hovered
-          <option value=unzoom>undo zoom mode
-          <option value=close>close popup
-        </select>
-      </label>
-      <label style="flex: 1" title="${trimLeft(`
-        Scale factors to use when “zooms to” selector is set to “custom”.
-        0 = fit to window,
-        0! = same as 0 but also removes smaller values,
-        * after a value marks the default zoom factor, for example: 1*
-        The popup won't shrink below the image's natural size or window size for bigger mages.
-        ${scalesHint}
-      `)}">Custom scale factors:
-        <input id=scales placeholder="${scalesHint}">
-      </label>
-    </li>
-    <li class="options row">
-      <div>
-        <label title="...or try to keep the original link/thumbnail unobscured by the popup">
-          <input type=checkbox id=center>Centered*</label>
-        <label title="Provides smoother experience but increases network traffic">
-          <input type=checkbox id=preload>Preload on hover*</label>
-        <label><input type=checkbox id=imgtab>Run in image tabs</label>
-      </div>
-      <div>
-        <label><input type=checkbox id=mute>Mute videos</label>
-        <label title="Disable only if you spoof the HTTP headers yourself">
-          <input type=checkbox id=xhr>Spoof hotlinking*</label>
-        <label title="Causes slowdowns so don't enable unless you explicitly use it in your custom CSS">
-          <input type=checkbox id=globalStatus>Set status on &lt;html&gt;*</label>
-      </div>
-      <div>
-        <label title="...or show a partial image while still loading">
-          <input type=checkbox id=waitLoad>Show when fully loaded*</label>
-        <label><input type=checkbox id=uiFadein>Fade-in transition</label>
-        <label><input type=checkbox id=uiFadeinGallery>Fade-in transition in gallery</label>
-      </div>
-      <label><input type=checkbox id=startAltShown>
-        Show a switch for 'auto-start' mode in userscript manager menu</label>
-    </li>
-    <li class="options stretch">
-      <label>Background
-        <span>
-          <input id=uiBackgroundColor type=color><u></u>
-          <input id=uiBackgroundOpacity type=range min=0 max=100 step=1 data-title="Opacity: $%">
-        </span>
-      </label>
-      <label>Border color, opacity, size
-        <span>
-          <input id=uiBorderColor type=color><u></u>
-          <input id=uiBorderOpacity type=range min=0 max=100 step=1 data-title="Opacity: $%">
-          <input id=uiBorder type=range min=0 max=20 step=1 data-title="Border size: $px">
-        </span>
-      </label>
-      <label>Shadow color, opacity, size
-        <span>
-          <input id=uiShadowColor type=color><u></u>
-          <input id=uiShadowOpacity type=range min=0 max=100 step=1 data-title="Opacity: $%">
-          <input id=uiShadow type=range min=0 max=100 step=1 data-title="
-            ${'Shadow blur radius: $px\n"0" disables the shadow.'}">
-        </span>
-      </label>
-      <label>Padding
-        <span><input id=uiPadding type=range min=0 max=100 step=1 data-title="Padding: $px"></span>
-      </label>
-      <label>Margin
-        <span><input id=uiMargin type=range min=0 max=100 step=1 data-title="Margin: $px"></span>
-      </label>
-    </li>
-    <li>
-      <a href="${MPIV_BASE_URL}Custom-CSS" target="_blank">Custom CSS:</a>&nbsp;
-      e.g. <b>#mpiv-popup { animation: none !important }</b>
-      <a tabindex=0 id=_reveal style="float: right"
-         title="You can copy parts of it to override them in your custom CSS">
-         View the built-in CSS</a>
-      <div class=column>
-        <textarea id=css spellcheck=false></textarea>
-        <textarea id=_cssApp spellcheck=false hidden readonly rows=30></textarea>
-      </div>
-    </li>
-    <li style="display: flex; justify-content: space-between;">
-      <div><a href="${MPIV_BASE_URL}Custom-host-rules" target="_blank">Custom host rules:</a></div>
-      <div style="white-space: nowrap">
-        To disable, put any symbol except <code>a..z 0..9 - .</code><br>
-        in "d" value, for example <code>"d": "!foo.com"</code>
-      </div>
-      <div>
-        <input id=_search type=search placeholder=Search style="width: 10em; margin-left: 1em">
-      </div>
-    </li>
-    <li style="margin-left: -3px; margin-right: -3px; overflow-y: auto; padding-left: 3px; padding-right: 3px;">
-      <div id=_rules class=column>
-        <textarea rows=1 spellcheck=false></textarea>
-      </div>
-    </li>
-    <li>
-      <div hidden id=_installLoading>Loading...</div>
-      <div hidden id=_installHint>Double-click the rule (or select and press Enter) to add it
-        . Click <code>Apply</code> or <code>OK</code> to confirm.</div>
-      <a href="${MPIV_BASE_URL}Rules" id=_install target="_blank">Install rule from repository...</a>
-    </li>
-  </ul>
-  <div style="text-align:center">
-    <button id=_ok accesskey=s>OK</button>
-    <button id=_apply accesskey=a>Apply</button>
-    <button id=_import style="margin-right: 0">Import</button>
-    <button id=_export style="margin-left: 0">Export</button>
-    <button id=_cancel>Cancel</button>
-    <div id=_exportNotification hidden>Copied to clipboard.</div>
-  </div>
-</main>`);
+`;
+
+function createSetupElement() {
+  const MPIV_BASE_URL = 'https://github.com/tophf/mpiv/wiki/';
+  const scalesHint = 'Leave it empty and click Apply or OK to restore the default values.';
+  const $newLink = (text, href, props) =>
+    $new('a', Object.assign({target: '_blank'}, href && {href}, props), text);
+  const $newCheck = (label, id, title = '', props) =>
+    $new('label', Object.assign({title}, props), [
+      $new('input', {id, type: 'checkbox'}),
+      label,
+    ]);
+  const $newKbd = s => s[0] === '{' ? $new('kbd', s.slice(1, -1)) : s;
+  const $newRange = (id, title = '', min = 0, max = 100, step = 1, type = 'range') =>
+    $new('input', {id, min, max, step, type, 'data-title': title});
+  const $newSelect = (label, id, values) =>
+    $new('label', [
+      label,
+      $new('select', {id}, Object.entries(values).map(([k, v]) =>
+        $new('option', Object.assign({value: k}, typeof v === 'object' ? v : {textContent: v})))),
+    ]);
+  const $newTR = ([name, val]) =>
+    $new('tr', !name ? $new('br') : [
+      $new('th', ((name = name.split(/(\n)/))[0] = $new('b', name[0])) && name),
+      $new('td', val.split(/({.+?})/).map($newKbd)),
+    ]);
+  const kAutoTooltip = '...when activation is "automatically"';
+  const kAutoProps = {'data-start-auto': ''};
+  return [
+    $new('style#_cssSetup', CSS_SETUP),
+    $new('style#_css'),
+    $new(`main#${PREFIX}setup`, [
+      $new('#_mover'),
+      $new('#_x', 'x'),
+      $new('ul#_ul.column', [
+        $new('details', {style: 'order:1; padding-top: .5em;'}, [
+          $new('summary', {style: 'cursor: pointer'},
+            $new('b', 'Help & hotkeys...')),
+          $new('#_usage', [
+            $new('table', [
+              ['Activate', 'hover the target'],
+              ['Deactivate', 'move cursor off target, or click, or zoom out fully'],
+              ['Ignore target', 'hold {Shift} ⏵ hover the target ⏵ release the key'],
+              ['Freeze popup', 'hold {Shift} ⏵ leave the target ⏵ release the key'],
+              ['Force-activate\n(videos or small pics)', 'hold {Ctrl} ⏵ hover the target ⏵ release the key'],
+            ].map($newTR)),
+            $new('table', [
+              ['Start zooming', 'configurable (automatic or via right-click)\nor tap {Shift} while popup is visible'],
+              ['Zoom', 'mouse wheel'],
+              [],
+              ['Rotate', '{9} {0} for "left" or "right"'],
+              ['Flip/mirror', '{h} {v} for "horizontal" or "vertical"'],
+              ['Previous/next\n(in album)', 'mouse wheel, {j} {k} or {←} {→} keys'],
+            ].map($newTR)),
+            $new('table', [
+              ['Antialiasing', '{a}'],
+              ['Caption in info', '{c}'],
+              ['Download', '{d}'],
+              ['Copy URL', '{u}'],
+              ['Copy Image', '{y}'],
+              ['Fullscreen', '{f}'],
+              ['Info', '{i}'],
+              ['Mute', '{m}'],
+              ['Night mode', '{n}'],
+              ['Open in tab', '{t}'],
+            ].map($newTR)),
+          ]),
+        ]),
+        $new('li.options.stretch', [
+          $newSelect('Popup shows on', 'start', {
+            context: 'Right-click / \u2261 / Ctrl',
+            contextMK: 'Right-click / \u2261',
+            contextM: 'Right-click',
+            contextK: {
+              textContent: '\u2261 key',
+              title: '\u2261 is the Menu key (near the right Ctrl)',
+            },
+            ctrl: 'Ctrl',
+            auto: 'automatically',
+          }),
+          $new('label', {title: kAutoTooltip, ...kAutoProps},
+            ['after, sec', $newRange('delay', 'seconds', .05, 10, .05, 'number')]),
+          $new('label', {title: '(if the full version of the hovered image is ...% larger)'},
+            ['if larger, %', $newRange('scale', null, 0, 100, 1, 'number')]),
+          $newSelect('Zoom activates on', 'zoom', {
+            context: 'Right click / Shift',
+            wheel: 'Wheel up / Shift',
+            shift: 'Shift',
+            auto: 'automatically',
+          }),
+          $newSelect('...and zooms to', 'fit', {
+            'all': 'fit to window',
+            'large': 'fit if larger',
+            'no': '100%',
+            '': {textContent: 'custom', title: 'Use custom scale factors'},
+          }),
+        ]),
+        $new('li.options', [
+          $new('label', ['Zoom step, %', $newRange('zoomStep', null, 100, 400, 1, 'number')]),
+          $newSelect('When fully zoomed out:', 'zoomOut', {
+            stay: 'stay in zoom mode',
+            auto: 'stay if still hovered',
+            unzoom: 'undo zoom mode',
+            close: 'close popup',
+          }),
+          $new('label', {
+            style: 'flex: 1',
+            title: `
+              Scale factors to use when “zooms to” selector is set to “custom”.
+              0 = fit to window,
+              0! = same as 0 but also removes smaller values,
+              * after a value marks the default zoom factor, for example: 1*
+              The popup won't shrink below the image's natural size or window size for bigger mages.
+              ${scalesHint}
+            `.trim().replace(/\n\s+/g, '\r'),
+          }, ['Custom scale factors:', $new('input#scales', {placeholder: scalesHint})]),
+        ]),
+        $new('li.options.row', [
+          $new([
+            $newCheck('Centered*', 'center',
+              '...or try to keep the original link/thumbnail unobscured by the popup'),
+            $newCheck('Preload on hover*', 'preload',
+              'Provides smoother experience but increases network traffic'),
+            $newCheck('Require Ctrl key for video*', 'videoCtrl', kAutoTooltip, kAutoProps),
+            $newCheck('Mute videos*', 'mute', 'Hotkey: "m" in the popup'),
+            $newCheck('Keep playing video*', 'keepVids',
+              '...until you press Esc key or click elsewhere'),
+            $newCheck('Keep preview on blur*', 'keepOnBlur',
+              'i.e. when mouse pointer moves outside the page'),
+          ]),
+          $new([
+            $newCheck('Wait for complete image*', 'waitLoad',
+              '...or immediately show a partial image while still loading'),
+            $new('div.flex', {style: 'align-items:center'}, [
+              $newCheck('Info: show for', 'uiInfo', 'Hotkey: "i" (or hold "Shift") in the popup'),
+              $new('input#uiInfoHide', {min: 1, step: 'any', type: 'number'}),
+              'sec',
+            ]),
+            $newCheck('Info: only once*', 'uiInfoOnce', '...or every time the info changes'),
+            $newCheck('Info: caption*', 'uiInfoCaption', 'Hotkey: "c" in the popup'),
+            $newCheck('Fade-in transition', 'uiFadein'),
+            $newCheck('Fade-in transition in gallery', 'uiFadeinGallery'),
+          ]),
+          $new([
+            $newCheck('Night mode*', 'night', 'Hotkey: "n" in the popup'),
+            $newCheck('Run in image tabs', 'imgtab'),
+            $newCheck('Spoof hotlinking*', 'xhr',
+              'Disable only if you spoof the HTTP headers yourself'),
+            $newCheck('Set status on <html>*', 'globalStatus',
+              "Causes slowdowns so don't enable unless you explicitly use it in your custom CSS"),
+            $newCheck('Auto-start switch in menu*', 'startAltShown',
+              "Show a switch for 'auto-start' mode in userscript manager menu"),
+          ]),
+        ]),
+        $new('li.options.stretch', [
+          $new('label', [
+            'Background',
+            $new('span', [
+              $new('input#uiBackgroundColor', {type: 'color'}), $new('u'),
+              $newRange('uiBackgroundOpacity', 'Opacity: $%'),
+            ]),
+          ]),
+          $new('label', [
+            'Border color, opacity, size',
+            $new('span', [
+              $new('input#uiBorderColor', {type: 'color'}), $new('u'),
+              $newRange('uiBorderOpacity', 'Opacity: $%'),
+              $newRange('uiBorder', 'Border size: $px', 0, 20),
+            ]),
+          ]),
+          $new('label', [
+            'Shadow color, opacity, size',
+            $new('span', [
+              $new('input#uiShadowColor', {type: 'color'}), $new('u'),
+              $newRange('uiShadowOpacity', 'Opacity: $%'),
+              $newRange('uiShadow', 'Shadow blur radius: $px\n"0" disables the shadow.', 0, 20),
+            ]),
+          ]),
+          $new('label', ['Padding', $new('span', $newRange('uiPadding', 'Padding: $px'))]),
+          $new('label', ['Margin', $new('span', $newRange('uiMargin', 'Margin: $px'))]),
+        ]),
+        $new('li', [
+          $newLink('Custom CSS:', `${MPIV_BASE_URL}Custom-CSS`),
+          ' e.g. ', $new('b', '#mpiv-popup { animation: none !important }'),
+          $newLink('View the built-in CSS', '', {
+            id: '_reveal',
+            tabIndex: 0,
+            style: 'float: right',
+            title: 'You can copy parts of it to override them in your custom CSS',
+          }),
+          $new('.column', [
+            $new('textarea#css', {spellcheck: false}),
+            $new('textarea#_cssApp', {spellcheck: false, hidden: true, readOnly: true, rows: 30}),
+          ]),
+        ]),
+        $new('li.flex', {style: 'justify-content: space-between;'}, [
+          $new('div',
+            $newLink('Custom host rules:', `${MPIV_BASE_URL}Custom-host-rules`)),
+          $new('div', {style: 'white-space: pre-line'}, [
+            'To disable, put any symbol except ', $new('code', 'a..z 0..9 - .'),
+            '\nin "d" value, for example ', $new('code', '"d": "!foo.com"'),
+          ]),
+          $new('div',
+            $new('input#_search',
+              {type: 'search', placeholder: 'Search', style: 'width: 10em; margin-left: 1em'})),
+        ]),
+        $new('li', {
+          style: 'margin-left: -3px; margin-right: -3px; overflow-y: auto; ' +
+                 'padding-left: 3px; padding-right: 3px;',
+        }, [
+          $new('div#_rules.column',
+            $new('textarea', {spellcheck: false, rows: 1})),
+        ]),
+        $new('li#_rules2'),
+      ]),
+      $new('div.flex', [
+        $new('button#_ok', {accessKey: 'o'}, 'OK'),
+        $new('button#_apply', {accessKey: 'a'}, 'Apply'),
+        $new('button#_cancel', 'Cancel'),
+        $new('a', {href: `${MPIV_BASE_URL}Rules`, style: 'margin: 0 auto'},
+          $new('button#_install', {style: 'color: inherit'}, 'Find rule...')),
+        $new('button#_import', 'Import'),
+        $new('button#_export', {style: 'margin: 0'}, 'Export'),
+        $new('div#_exportNotification', {hidden: true}, 'Copied to clipboard'),
+      ]),
+    ]),
+  ];
 }
 
 function createGlobalStyle() {
@@ -3805,8 +3994,6 @@ function createGlobalStyle() {
   top: 0;
   left: 0;
   right: 0;
-  opacity: 0;
-  transition: opacity 1s ease .25s;
   text-align: center;
   font-family: sans-serif;
   font-size: 15px;
@@ -3815,14 +4002,25 @@ function createGlobalStyle() {
   color: white;
   padding: 4px 10px;
   text-shadow: .5px .5px 2px #000;
+  transition: opacity 1s ease .25s;
+  opacity: 0;
 }
-#\mpiv-bar.\mpiv-show,
 #\mpiv-bar[data-force] {
+  transition: none;
+}
+#\mpiv-bar.\mpiv-show {
   opacity: 1;
 }
-#\mpiv-bar[data-zoom]::after {
+#\mpiv-bar[data-zoom][data-prefix]::before {
+  content: "[" attr(data-prefix) "] ";
+  color: gold;
+}
+#\mpiv-bar[data-zoom]:not(:empty)::after {
   content: " (" attr(data-zoom) ")";
   opacity: .8;
+}
+#\mpiv-bar[data-zoom]:empty::after {
+  content: attr(data-zoom);
 }
 #\mpiv-popup.\mpiv-show {
   display: inline;
@@ -3865,9 +4063,15 @@ ${App.popupStyleBase = `
   animation: none;
   transition: none;
 }
-#\mpiv-popup[data-no-aa],
+#\mpiv-popup[${NOAA_ATTR}],
 #\mpiv-popup.\mpiv-zoom-max {
   image-rendering: pixelated;
+}
+#\mpiv-popup.\mpiv-night:not(#\\0) {
+  box-shadow: 0 0 0 ${Math.max(screen.width, screen.height)}px #000;
+}
+body:has(#\mpiv-popup.\mpiv-night)::-webkit-scrollbar {
+  background: #000;
 }
 #\mpiv-setup {
 }
@@ -3934,7 +4138,7 @@ const dropEvent = e =>
   (e.preventDefault(), e.stopPropagation());
 
 const ensureArray = v =>
-  Array.isArray(v) ? v : [v];
+  isArray(v) ? v : [v];
 
 /** @param {KeyboardEvent} e */
 const eventModifiers = e =>
@@ -3943,7 +4147,12 @@ const eventModifiers = e =>
   (e.metaKey ? '#' : '') +
   (e.shiftKey ? '+' : '');
 
+/** @param {KeyboardEvent} e */
+const describeKey = e => eventModifiers(e) + (e.key && e.key.length > 1 ? e.key : e.code);
+
 const isFunction = val => typeof val === 'function';
+
+const isVideo = el => el && el.tagName === 'VIDEO';
 
 const now = performance.now.bind(performance);
 
@@ -3954,18 +4163,21 @@ const sumProps = (...props) => {
   return sum;
 };
 
-const tryCatch = function (fn, ...args) {
+const tryCatch = (fn, ...args) => {
   try {
-    return fn.apply(this, args);
+    return fn(...args);
   } catch (e) {}
 };
 
 const tryJSON = str =>
   tryCatch(JSON.parse, str);
 
-const pick = (obj, path, fn) => (
-  obj = path.split(/[[.]/).reduce((res, k) => res && res[k.endsWith(']') ? k.slice(0, -1) : k], obj)
-) && (fn ? fn(obj) : obj);
+const pick = (obj, path, fn) => {
+  if (obj && path)
+    for (const p of path.split('.'))
+      if (obj) obj = obj[p]; else break;
+  return fn && obj !== undefined ? fn(obj) : obj;
+};
 
 const $ = (sel, node = doc) =>
   node.querySelector(sel) || false;
@@ -3973,8 +4185,40 @@ const $ = (sel, node = doc) =>
 const $$ = (sel, node = doc) =>
   node.querySelectorAll(sel);
 
-const $create = (tag, props) =>
-  Object.assign(doc.createElement(tag), props);
+const $new = (sel, props, children) => {
+  if (typeof sel !== 'string') {
+    children = props;
+    props = sel;
+    sel = '';
+  }
+  if (!children && props != null && ({}).toString.call(props) !== '[object Object]') {
+    children = props;
+    props = null;
+  }
+  const isFrag = sel === 'fragment';
+  const [, tag, id, cls] = sel.match(/^(\w*)(?:#([^.]+))?(?:\.(.+))?$/);
+  const el = isFrag ? doc.createDocumentFragment() : doc.createElement(tag || 'div');
+  if (id) el.id = id;
+  if (cls) el.className = cls.replace(/\./g, ' ');
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      if (!k.startsWith('data-')) {
+        el[k] = v;
+      } else if (v != null) {
+        el.setAttribute(k, v);
+      }
+    }
+  }
+  if (children != null) {
+    if (isArray(children))
+      el.append(...children.filter(Boolean));
+    else if (children instanceof Node)
+      el.appendChild(children);
+    else
+      el.textContent = children;
+  }
+  return el;
+};
 
 const $css = (el, props) =>
   Object.entries(props).forEach(([k, v]) =>
@@ -4002,24 +4246,48 @@ const $propUp = (node, prop) =>
 const $remove = node =>
   node && node.remove();
 
+const $dataset = ({dataset: d}, key, val) =>
+  val == null ? delete d[key] : (d[key] = val);
+
 //#endregion
 //#region Init
 
-nonce = ($('script[nonce]') || {}).nonce || '';
-
-Config.load({save: true}).then(res => {
-  cfg = res;
+(async () => {
+  cfg = await Config.load({save: true});
+  if (!doc.body) {
+    await new Promise(resolve =>
+      new MutationObserver((_, mo) => doc.body && (mo.disconnect(), resolve()))
+        .observe(document, {subtree: true, childList: true}));
+  }
+  const el = doc.body.firstElementChild;
+  if (el) {
+    App.isImageTab = el === doc.body.lastElementChild && el.matches('img, video');
+    App.isEnabled = cfg.imgtab || !App.isImageTab;
+  }
   if (Menu) Menu.register();
-
-  if (doc.body) App.checkImageTab();
-  else addEventListener('DOMContentLoaded', App.checkImageTab, {once: true});
-
   addEventListener('mouseover', Events.onMouseOver, true);
   addEventListener('contextmenu', Events.onContext, true);
   addEventListener('keydown', Events.onKeyDown, true);
+  addEventListener('visibilitychange', Events.onVisibility, true);
+  addEventListener('blur', Events.onVisibility, true);
   if (['greasyfork.org', 'github.com'].includes(hostname))
     addEventListener('click', setupClickedRule, true);
   addEventListener('message', App.onMessage, true);
-});
+})();
+
+if (window.trustedTypes) {
+  const TT = window.trustedTypes;
+  const CP = 'createPolicy';
+  const createPolicy = TT[CP];
+  TT[CP] = function ovr(name, opts) {
+    let fn;
+    const p = createPolicy.call(TT, name, opts);
+    if ((trustedHTML || opts[fn = 'createHTML'] && (trustedHTML = p[fn].bind(p))) &&
+        (trustedScript || opts[fn = 'createScript'] && (trustedScript = p[fn].bind(p))) &&
+        TT[CP] === ovr)
+      delete TT[CP];
+    return p;
+  };
+}
 
 //#endregion

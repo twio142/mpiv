@@ -135,7 +135,7 @@ const App = {
     if (elConfig) console.info({node, rule, url, match});
     if (ai.node) App.deactivate();
     ai = info;
-    ai.force = event.ctrlKey;
+    ai.force = event.altKey;
     ai.gNum = 0;
     ai.zooming = cfg.css.includes(`${PREFIX}zooming`);
     Util.suppressTooltip();
@@ -907,8 +907,8 @@ const Events = {
     const p = ai.popup || false; // simple polyfill for `p?.foo`
     if (!p &&
         !Events.ignoreKeyHeld &&
-        key === '^Control' &&
-        (cfg.start === 'ctrl' || cfg.start === 'context' || ai.rule.manual)) {
+        key === '!Alt' &&
+        (cfg.start === 'alt' || cfg.start === 'context' || ai.rule.manual)) {
       dropEvent(e);
       if (Events.hoverData) {
         Events.hoverData.e = e;
@@ -945,20 +945,29 @@ const Events = {
       case 'KeyK':
         Gallery.next(-1);
         break;
+      case 'KeyU':
+        Req.copyURL();
+        App.deactivate();
+        break;
+      case 'KeyY':
+        Req.copyImage();
+        App.deactivate();
+        break;
       case 'KeyD':
         Req.saveFile();
+        App.deactivate();
         break;
       case 'KeyH': // flip horizontally
       case 'KeyV': // flip vertically
-      case 'KeyL': // rotate left
-      case 'KeyR': // rotate right
+      case 'Digit9': // rotate left
+      case 'Digit0': // rotate right
         if (!p)
           return;
         if (key === 'KeyH' || key === 'KeyV') {
           const side = !!(ai.rotate % 180) ^ (key === 'KeyH') ? 'flipX' : 'flipY';
           ai[side] = !ai[side];
         } else {
-          ai.rotate = ((ai.rotate || 0) + 90 * (key === 'KeyL' ? -1 : 1) + 360) % 360;
+          ai.rotate = ((ai.rotate || 0) + 90 * (key === 'Digit9' ? -1 : 1) + 360) % 360;
         }
         Bar.updateDetails();
         Popup.move();
@@ -991,8 +1000,8 @@ const Events = {
         App.deactivate({wait: true});
         break;
       case '!Alt':
-        return;
-      default:
+        // return;
+      // default:
         App.deactivate({wait: true});
         return;
     }
@@ -2511,6 +2520,30 @@ const Req = {
     }
   },
 
+  copyURL() {
+    const url = ai.popup.src || ai.popup.currentSrc;
+    GM.setClipboard(url);
+  },
+
+  async copyImage() {
+    const url = ai.popup.src || ai.popup.currentSrc;
+    GM.xmlHttpRequest({
+        url: url,
+        name,
+        headers: {Referer: url},
+        method: 'get',
+        responseType: 'blob',
+        overrideMimeType: 'image/png',
+        onerror: e => {
+          Bar.set(`Could not copy image: ${e.error || e.message || e}.`, 'error');
+        },
+        onprogress: Req.getImageProgress,
+        onload({response}) {
+          navigator.clipboard.write([new ClipboardItem({ 'image/png': response })]);
+        },
+      });
+  },
+
   async saveFile() {
     const url = ai.popup.src || ai.popup.currentSrc;
     let name = Req.getFileName(ai.imageUrl || url);
@@ -3593,12 +3626,12 @@ function createConfigHtml() {
         <tr><th>Deactivate</th><td>move cursor off thumbnail, or click, or zoom out fully</td></tr>
         <tr><th>Prevent/freeze</th><td>hold down <kbd>Shift</kbd> while entering/leaving thumbnail</td></tr>
         <tr><th>Force-activate<br>(for small pics)</th>
-          <td>hold <kbd>Ctrl</kbd> while entering image element</td></tr>
+          <td>hold <kbd>Alt</kbd> while entering image element</td></tr>
         <tr><td>&nbsp;</td></tr>
         <tr><th>Start zooming</th>
           <td>configurable: automatic or via right-click / <kbd>Shift</kbd> while popup is visible</td></tr>
         <tr><th>Zoom</th><td>mouse wheel</td></tr>
-        <tr><th>Rotate</th><td><kbd>L</kbd> <kbd>r</kbd> keys (left or right)</td></tr>
+        <tr><th>Rotate</th><td><kbd>9</kbd> <kbd>0</kbd> keys (left or right)</td></tr>
         <tr><th>Flip/mirror</th><td><kbd>h</kbd> <kbd>v</kbd> keys (horizontally or vertically)</td></tr>
         <tr><th>Previous/next<br>in album</th>
           <td>mouse wheel, <kbd>j</kbd> <kbd>k</kbd> or <kbd>←</kbd> <kbd>→</kbd> keys</td></tr>
@@ -3606,6 +3639,8 @@ function createConfigHtml() {
       </table>
       <table>
         <tr><th>Antialiasing on/off</th><td><kbd>a</kbd></td><td rowspan=4>key while popup is visible</td></tr>
+        <tr><th>Copy URL</th><td><kbd>u</kbd></td></tr>
+        <tr><th>Copy image</th><td><kbd>y</kbd></td></tr>
         <tr><th>Download</th><td><kbd>d</kbd></td></tr>
         <tr><th>Mute/unmute</th><td><kbd>m</kbd></td></tr>
         <tr><th>Open in tab</th><td><kbd>t</kbd></td></tr>
@@ -3614,11 +3649,11 @@ function createConfigHtml() {
     <li class="options stretch">
       <label>Popup shows on
         <select id=start>
-          <option value=context>Right-click / &#8801; / Ctrl
+          <option value=context>Right-click / &#8801; / Alt
           <option value=contextMK>Right-click / &#8801;
           <option value=contextM>Right-click
           <option value=contextK title="&#8801; is the Menu key (near the right Ctrl)">&#8801; key
-          <option value=ctrl>Ctrl
+          <option value=alt>Alt
           <option value=auto>automatically
         </select>
       </label>

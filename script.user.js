@@ -974,6 +974,13 @@ const Events = {
       case 'KeyK':
         Gallery.next(-1);
         break;
+      case 'KeyU':
+        Req.copyURL();
+        App.deactivate();
+        break;
+      case 'KeyY':
+        Req.copyImage();
+        App.deactivate();
       case 'KeyC':
         if (ai.bar.firstChild) {
           Bar.setText('');
@@ -985,6 +992,7 @@ const Events = {
         break;
       case 'KeyD':
         Req.saveFile();
+        App.deactivate();
         break;
       case 'KeyF':
         if (p !== document.fullscreenElement) p.requestFullscreen();
@@ -992,15 +1000,15 @@ const Events = {
         break;
       case 'KeyH': // flip horizontally
       case 'KeyV': // flip vertically
-      case 'KeyL': // rotate left
-      case 'KeyR': // rotate right
+      case 'Digit9': // rotate left
+      case 'Digit0': // rotate right
         if (!p)
           return;
         if (key === 'KeyH' || key === 'KeyV') {
           const side = !!(ai.rotate % 180) ^ (key === 'KeyH') ? 'flipX' : 'flipY';
           ai[side] = !ai[side];
         } else {
-          ai.rotate = ((ai.rotate || 0) + 90 * (key === 'KeyL' ? -1 : 1) + 360) % 360;
+          ai.rotate = ((ai.rotate || 0) + 90 * (key === 'Digit9' ? -1 : 1) + 360) % 360;
         }
         Bar.updateDetails();
         Popup.move();
@@ -2558,6 +2566,30 @@ const Req = {
     }
   },
 
+  copyURL() {
+    const url = ai.popup.src || ai.popup.currentSrc;
+    GM.setClipboard(url);
+  },
+
+  async copyImage() {
+    const url = ai.popup.src || ai.popup.currentSrc;
+    GM.xmlHttpRequest({
+        url: url,
+        name,
+        headers: {Referer: url},
+        method: 'get',
+        responseType: 'blob',
+        overrideMimeType: 'image/png',
+        onerror: e => {
+          Bar.set(`Could not copy image: ${e.error || e.message || e}.`, 'error');
+        },
+        onprogress: Req.getImageProgress,
+        onload({response}) {
+          navigator.clipboard.write([new ClipboardItem({ 'image/png': response })]);
+        },
+      });
+  },
+
   async saveFile() {
     const url = ai.popup.src || ai.popup.currentSrc;
     let name = Req.getFileName(ai.imageUrl || url);
@@ -3763,7 +3795,7 @@ function createSetupElement() {
               ['Start zooming', 'configurable (automatic or via right-click)\nor tap {Shift} while popup is visible'],
               ['Zoom', 'mouse wheel'],
               [],
-              ['Rotate', '{L} {r} for "left" or "right"'],
+              ['Rotate', '{9} {0} for "left" or "right"'],
               ['Flip/mirror', '{h} {v} for "horizontal" or "vertical"'],
               ['Previous/next\n(in album)', 'mouse wheel, {j} {k} or {←} {→} keys'],
             ].map($newTR)),
@@ -3771,6 +3803,8 @@ function createSetupElement() {
               ['Antialiasing', '{a}'],
               ['Caption in info', '{c}'],
               ['Download', '{d}'],
+              ['Copy URL', '{u}'],
+              ['Copy Image', '{y}'],
               ['Fullscreen', '{f}'],
               ['Info', '{i}'],
               ['Mute', '{m}'],

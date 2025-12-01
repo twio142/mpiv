@@ -52,6 +52,8 @@
 // @connect     user-images.githubusercontent.com
 //
 // @supportURL  https://github.com/tophf/mpiv/issues
+// @updateURL   https://raw.githubusercontent.com/twio142/mpiv/main/script.user.js
+// @downloadURL https://raw.githubusercontent.com/twio142/mpiv/main/script.user.js
 // @icon        https://raw.githubusercontent.com/tophf/mpiv/master/icon.png
 // ==/UserScript==
 

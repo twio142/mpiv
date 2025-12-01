@@ -1023,6 +1023,13 @@ const Events = {
         GM.openInTab(Util.tabFixUrl() || p.src);
         App.deactivate();
         break;
+      case 'KeyU':
+        GM.setClipboard(ai.imageUrl);
+        Bar.set('URL copied to clipboard', 'info');
+        break;
+      case 'KeyY':
+        Events.copyImageToClipboard(p);
+        break;
       case 'Minus':
       case 'NumpadSubtract':
         if (ai.zoomed) {
@@ -1171,6 +1178,82 @@ const Events = {
       ai.popup.classList.add(`${PREFIX}zooming`);
     Popup.move();
     Bar.updateDetails();
+  },
+
+  copyImageToClipboard(p) {
+    if (!p) return;
+
+    const urlToCopy = ai.imageUrl;
+    if (!urlToCopy) {
+      Bar.set('No image URL available to copy.', 'error');
+      return;
+    }
+
+    if (isVideo(p)) {
+      Bar.set('Copying video frame...', 'info');
+      const canvas = document.createElement('canvas');
+      canvas.width = p.videoWidth;
+      canvas.height = p.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(p, 0, 0);
+
+      canvas.toBlob(function(blob) {
+        if (!blob) {
+          return Bar.set('Failed to copy video frame (blob conversion failed)', 'error');
+        }
+        try {
+          const item = new ClipboardItem({ [blob.type]: blob });
+          navigator.clipboard.write([item]).then(function() {
+            Bar.set('Video frame copied to clipboard', 'info');
+          }).catch(function(error) {
+            console.error('Failed to copy video frame to clipboard (clipboard API):', error);
+            Bar.set('Failed to copy video frame (clipboard API error)', 'error');
+          });
+        } catch (err) {
+          console.error('ClipboardItem API not supported or failed:', err);
+          Bar.set('Failed to copy: Clipboard API may not be supported', 'error');
+        }
+      }, 'image/png');
+    } else if (p.tagName === 'IMG') {
+      Bar.set('Copying image...', 'info');
+      const tempImage = new Image();
+      tempImage.crossOrigin = 'anonymous';
+
+      tempImage.onload = function() {
+        const canvas = document.createElement('canvas');
+        canvas.width = tempImage.naturalWidth;
+        canvas.height = tempImage.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(tempImage, 0, 0);
+
+        canvas.toBlob(function(blob) {
+          if (!blob) {
+            return Bar.set('Failed to copy image (blob conversion failed)', 'error');
+          }
+          try {
+            const item = new ClipboardItem({ [blob.type]: blob });
+            navigator.clipboard.write([item]).then(function() {
+              Bar.set('Image copied to clipboard', 'info');
+            }).catch(function(error) {
+              console.error('Failed to copy image to clipboard (clipboard API):', error);
+              Bar.set('Failed to copy image (clipboard API error)', 'error');
+            });
+          } catch (err) {
+            console.error('ClipboardItem API not supported or failed:', err);
+            Bar.set('Failed to copy: Clipboard API may not be supported', 'error');
+          }
+        }, 'image/png');
+      };
+
+      tempImage.onerror = function() {
+        console.error('Failed to load image for copying:', urlToCopy);
+        Bar.set('Failed to copy image (loading error)', 'error');
+      };
+
+      tempImage.src = urlToCopy;
+    } else {
+      Bar.set('Cannot copy this type of media as image.', 'error');
+    }
   },
 };
 
@@ -3800,6 +3883,8 @@ function createSetupElement() {
               ['Mute', '{m}'],
               ['Night mode', '{n}'],
               ['Open in tab', '{t}'],
+              ['Copy URL', '{u}'],
+              ['Copy Image', '{y}'],
             ].map($newTR)),
           ]),
         ]),

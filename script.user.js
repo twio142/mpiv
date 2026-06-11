@@ -25,7 +25,7 @@
 // @grant       GM.setValue
 // @grant       GM.xmlHttpRequest
 //
-// @version     1.4.8
+// @version     1.4.9
 // @author      tophf
 //
 // @original-version 2017.9.29
@@ -996,6 +996,9 @@ const Events = {
         if (p !== document.fullscreenElement) p.requestFullscreen();
         else document.exitFullscreen();
         break;
+      case 'KeyG':
+        Events.searchWithGoogle(p);
+        break;
       case 'KeyH': // flip horizontally
       case 'KeyV': // flip vertically
       case 'KeyL': // rotate left
@@ -1022,7 +1025,7 @@ const Events = {
         ai.night = p.classList.toggle(`${PREFIX}night`);
         break;
       case 'KeyT':
-        GM.openInTab(Util.tabFixUrl() || p.src);
+        GM.openInTab(Util.tabFixUrl() || p.src, false);
         App.deactivate();
         break;
       case 'KeyU':
@@ -1255,6 +1258,54 @@ const Events = {
       tempImage.src = urlToCopy;
     } else {
       Bar.set('Cannot copy this type of media as image.', 'error');
+    }
+  },
+
+  async searchWithGoogle(p) {
+    if (!p) return;
+
+    const openLens = url =>
+      GM.openInTab('https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(url), false);
+
+    const uploadAndOpen = dataUrl => {
+      Bar.set('Uploading image...', 'info');
+      const form = new FormData();
+      form.append('imgdata', dataUrl);
+      GM.xmlHttpRequest({
+        method: 'POST',
+        url: 'https://sbi.ccloli.com/img/upload.php',
+        data: form,
+        onload: r => openLens(r.responseText),
+        onerror: () => Bar.set('Upload failed', 'error'),
+      });
+    };
+
+    const toDataUrl = blob => new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(blob);
+    });
+
+    if (isVideo(p)) {
+      const canvas = document.createElement('canvas');
+      canvas.width = p.videoWidth;
+      canvas.height = p.videoHeight;
+      canvas.getContext('2d').drawImage(p, 0, 0);
+      canvas.toBlob(async blob => {
+        if (!blob) return Bar.set('Failed to capture video frame', 'error');
+        uploadAndOpen(await toDataUrl(blob));
+      }, 'image/png');
+    } else {
+      const src = p.src;
+      if (!src) return Bar.set('No image URL available', 'error');
+      if (/^data:\s*.*?;\s*base64,/.test(src)) {
+        uploadAndOpen(src);
+      } else if (/^(?:blob:|filesystem:)/.test(src)) {
+        const blob = await fetch(src).then(r => r.blob());
+        uploadAndOpen(await toDataUrl(blob));
+      } else {
+        openLens(src);
+      }
     }
   },
 };
@@ -3881,6 +3932,7 @@ function createSetupElement() {
               ['Caption in info', '{c}'],
               ['Download', '{d}'],
               ['Fullscreen', '{f}'],
+              ['Search with Google', '{g}'],
               ['Info', '{i}'],
               ['Mute', '{m}'],
               ['Night mode', '{n}'],
